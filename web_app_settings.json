@@ -1,0 +1,13 @@
+{
+  "person_model_path": "/home/waseem/Desktop/inference_web_app/models/yolo26n.pt",
+  "ppe_model_path": "/home/waseem/Desktop/inference_web_app/models/ppe-detection-pt-1.2.6/ppe-detection-pt/ppe-detection.pt",
+  "sm_model_path": "__none__",
+  "video_folder": "/home/waseem/Downloads/esbaar",
+  "selected_video": "/home/waseem/Downloads/esbaar/D02_Test_Fire_And_Smoke.mp4",
+  "person_conf": 0.4,
+  "ppe_conf": 0.4,
+  "sm_conf": 0.7,
+  "frame_step": 1,
+  "simulate_realtime": true,
+  "playing": false
+}

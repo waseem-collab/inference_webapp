@@ -1,0 +1,10 @@
+smoke
+fire
+forklift
+bopt
+crane
+eot-crane
+truck
+car
+fall
+fire-extinguisher
