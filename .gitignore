@@ -1,0 +1,7 @@
+# All packaged models under the app models directory
+models/
+
+# Optional: uncomment if you also keep weights outside `models/`
+# *.pt
+# *.pth
+# *.onnx
