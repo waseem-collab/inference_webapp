@@ -573,7 +573,7 @@ def overlay_info(frame, frame_idx, total_frames, fps, playing, ppe_conf, person_
     cv2.putText(frame, text, (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
     cv2.putText(
         frame,
-        "Space: Play/Pause | A/D: -/+30f | Arrows/J/L: -/+1f | M: Manual infer | G: Draw box | S: Save person | B: Save background | Q: Quit",
+        "Space: Play/Pause | A/D: -/+30f | Arrows/J/L: -/+1f | M: Manual infer | G: Draw box | S: Save person | B: Save person to BG | Q: Quit",
         (10, 56),
         cv2.FONT_HERSHEY_SIMPLEX,
         0.52,
@@ -907,21 +907,19 @@ def main():
                         break
         elif key_char in (ord("b"), ord("B")):
             playing = False
+            if frame is None:
+                continue
             if pending_manual_boxes and pending_manual_boxes_frame == frame_idx:
                 saved_count = 0
                 for manual_idx, manual_box in enumerate(pending_manual_boxes):
-                    save_path = save_person_crop(
-                        frame, frame_idx, manual_idx, manual_box, output_dir=BACKGROUND_CROPS_DIR
-                    )
-                    if save_path is None:
-                        continue
-                    saved_count += 1
-                    print(f"Saved background crop: {save_path}")
+                    save_path = save_person_crop(frame, frame_idx, manual_idx, manual_box, output_dir=BACKGROUND_CROPS_DIR)
+                    if save_path:
+                        saved_count += 1
+                        print(f"Saved background crop: {save_path}")
                 pending_manual_boxes = []
                 pending_manual_boxes_frame = -1
                 if saved_count == 0:
-                    print("Could not save any background crop.")
-                    continue
+                    print("Could not save any manual crop to background.")
             else:
                 if not current_person_boxes:
                     print("No visible person detected in current frame. Press G to draw a manual box.")
@@ -930,17 +928,11 @@ def main():
                 if selected_idx is None:
                     continue
                 selected_box = current_person_boxes[selected_idx]
-                save_path = save_person_crop(
-                    frame, frame_idx, selected_idx, selected_box, output_dir=BACKGROUND_CROPS_DIR
-                )
-                if save_path is None:
-                    print("Could not save background crop for this selection.")
-                    continue
-                print(f"Saved background crop: {save_path}")
-            if not refresh_current_inference():
-                if not seek_and_load(frame_idx + 1, 1):
-                    if not seek_and_load(frame_idx - 1, -1):
-                        break
+                save_path = save_person_crop(frame, frame_idx, selected_idx, selected_box, output_dir=BACKGROUND_CROPS_DIR)
+                if save_path:
+                    print(f"Saved background crop: {save_path}")
+                else:
+                    print("Could not save background crop.")
         elif key_char == ord("a"):
             frame_idx = max(0, frame_idx - 30)
             seek_and_load(frame_idx, -1)

@@ -6,10 +6,11 @@ import os
 import threading
 import time
 import webbrowser
+from collections import OrderedDict
 from pathlib import Path
 
 import cv2
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, jsonify, request, send_file
 from ultralytics import YOLO
 
 from PPE import ppe_inference
@@ -25,7 +26,28 @@ CROPS_ROOT = Path(__file__).resolve().parent / "crops"
 
 
 app = Flask(__name__)
+
+
+@app.after_request
+def _add_cors_headers(resp):
+    # Allow the React dev server (and the camera-manager app) to call these
+    # endpoints and embed the MJPEG stream cross-origin.
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return resp
+
+
+@app.route("/api/<path:_rest>", methods=["OPTIONS"])
+def _cors_preflight(_rest):
+    return ("", 204)
+
+
+# state_lock guards `state`/`runtime` and OpenCV capture access; held only briefly.
+# inference_lock serializes the heavy YOLO predict calls so they never run under
+# state_lock — that keeps control/seek/status endpoints snappy while playing.
 state_lock = threading.Lock()
+inference_lock = threading.Lock()
 model_cache = {}
 
 state = {
@@ -39,6 +61,7 @@ state = {
     "sm_conf": 0.7,
     "frame_step": 1,
     "simulate_realtime": True,
+    "ppe_inside_person": True,
     "playing": False,
 }
 
@@ -56,6 +79,171 @@ runtime = {
     "last_person_boxes": [],
     "last_action": "",
     "manual_boxes_by_frame": {},
+    # Bumped on every seek / video-change / stop. Buffered frames tagged with an
+    # older epoch are discarded so the stream never shows stale prefetched frames.
+    "epoch": 0,
+}
+
+# --- Persistent annotation cache (YouTube-style multi-segment "loaded" bar) ---
+# Each frame is annotated AT MOST ONCE per configuration and kept in frame_cache.
+# Revisiting an already-annotated frame is instant — we only re-annotate when the
+# configuration changes (model / conf / step / video → cache cleared) or when a
+# frame was dropped by the LRU memory cap. The seek bar shows every cached region
+# as a grey segment.
+#
+# Locking: cache_lock guards frame_cache + cache_state; never held with state_lock.
+# The worker owns _worker_cap exclusively.
+cache_lock = threading.Lock()
+DISPLAY_PACE_FACTOR = 1.0           # playback pacing vs real time (1.0 = real time)
+CACHE_MAX_FRAMES = 8000            # LRU cap; also how much of a long video stays loaded
+
+frame_cache = OrderedDict()        # frame_idx -> (jpg_bytes, person_boxes); LRU order
+cache_state = {"cfg_key": "", "epoch": 0, "fill_cursor": 0}
+
+# Capture owned solely by the prerender worker (sequential reads).
+_worker_cap = {"cap": None, "video": "", "pos": -2}
+
+
+def compute_cfg_key() -> str:
+    """Fingerprint of everything that changes rendering. Caller holds state_lock."""
+    return "|".join(str(x) for x in (
+        state["selected_video"], state["person_model_path"], state["ppe_model_path"],
+        state["sm_model_path"], state["person_conf"], state["ppe_conf"],
+        state["sm_conf"], state["ppe_inside_person"], state["frame_step"],
+    ))
+
+
+def cache_sync_cfg(cfg_key: str) -> int:
+    """Clear the cache if config changed. Returns current epoch. Holds cache_lock."""
+    if cache_state["cfg_key"] != cfg_key:
+        frame_cache.clear()
+        cache_state["cfg_key"] = cfg_key
+        cache_state["fill_cursor"] = 0
+        cache_state["epoch"] += 1
+    return cache_state["epoch"]
+
+
+def cache_get(idx: int):
+    """Return cached (jpg, boxes), marking it recently used. Holds cache_lock."""
+    item = frame_cache.get(idx)
+    if item is not None:
+        frame_cache.move_to_end(idx)
+    return item
+
+
+def cache_put(idx: int, jpg, boxes):
+    """Store an annotated frame, evicting least-recently-used past the cap. Holds cache_lock."""
+    frame_cache[idx] = (jpg, boxes)
+    frame_cache.move_to_end(idx)
+    while len(frame_cache) > CACHE_MAX_FRAMES:
+        frame_cache.popitem(last=False)
+
+
+def cached_ranges(step: int):
+    """Cached frames grouped into contiguous [start, end] runs (on the step grid)."""
+    keys = sorted(frame_cache.keys())
+    ranges = []
+    for k in keys:
+        if ranges and (k - ranges[-1][1]) == step:
+            ranges[-1][1] = k
+        else:
+            ranges.append([k, k])
+    return ranges
+
+
+def pick_next_to_annotate(playhead: int, step: int, total: int, fill_cursor: int):
+    """
+    Choose the next frame to annotate. Holds cache_lock. Returns (idx, new_cursor).
+    Strategy: fill EVERYTHING from the playhead to the END first (so pausing loads
+    the whole rest of the video), then backfill 0..playhead. A forward cursor keeps
+    the ahead-scan cheap; seeks reset it to the new position.
+    Returns (None, cursor) when there's nothing left to load right now.
+    """
+    # 1) Ahead of the playhead, to the end of the video. This ALWAYS runs — even at
+    #    the memory cap — because cache_put evicts the least-recently-used (far)
+    #    frame to make room, so the worker never stops loading what's coming up.
+    c = max(int(fill_cursor), int(playhead), 0)
+    while total <= 0 or c <= total - 1:
+        if c not in frame_cache:
+            return c, c + step       # annotate c, advance the cursor past it
+        c += step
+        if total <= 0:
+            break
+
+    # 2) Everything ahead is cached — backfill 0..playhead, but only while there's
+    #    spare capacity (so backfill never fights the ahead-fill for cache slots).
+    if len(frame_cache) < CACHE_MAX_FRAMES:
+        b = 0
+        while b < playhead:
+            if b not in frame_cache:
+                return b, c          # keep the ahead-cursor where it is
+            b += step
+
+    return None, c                   # nothing to do right now
+
+
+def worker_read(video: str, idx: int):
+    """Read one frame for the worker, reusing a sequential capture when possible."""
+    wc = _worker_cap
+    if wc["cap"] is None or wc["video"] != video:
+        if wc["cap"] is not None:
+            wc["cap"].release()
+        wc["cap"] = cv2.VideoCapture(video)
+        wc["video"] = video
+        wc["pos"] = -2
+    cap = wc["cap"]
+    if not cap.isOpened():
+        return None
+    if idx != wc["pos"] + 1:
+        cap.set(cv2.CAP_PROP_POS_FRAMES, idx)
+    ok, frame = cap.read()
+    if not ok or frame is None:
+        return None
+    wc["pos"] = idx
+    return frame
+
+
+def read_raw_frame(video: str, frame_idx: int):
+    """Fetch a single raw (unannotated) frame on demand — used by crop actions."""
+    if not video:
+        return None
+    cap = cv2.VideoCapture(video)
+    try:
+        if not cap.isOpened():
+            return None
+        cap.set(cv2.CAP_PROP_POS_FRAMES, max(0, int(frame_idx)))
+        ok, frame = cap.read()
+        return frame if ok else None
+    finally:
+        cap.release()
+
+
+def ensure_video_meta(video: str):
+    """Populate runtime fps/total_frames for a video if not already known."""
+    if not video:
+        return
+    if runtime["active_video"] == video and runtime["total_frames"] > 0:
+        return
+    cap = cv2.VideoCapture(video)
+    try:
+        if cap.isOpened():
+            runtime["total_frames"] = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            runtime["fps"] = fps if fps and fps > 1e-6 else 25.0
+            runtime["active_video"] = video
+    finally:
+        cap.release()
+
+# Guards the export worker so only one render-to-file job runs at a time.
+export_lock = threading.Lock()
+export_state = {
+    "running": False,
+    "done": False,
+    "error": "",
+    "progress": 0,
+    "total": 0,
+    "output_path": "",
+    "download_name": "",
 }
 
 
@@ -153,43 +341,107 @@ def get_or_load_model(model_path: str):
 
 
 def release_capture():
-    cap = runtime["cap"]
-    if cap is not None:
-        cap.release()
+    """Tear down the annotation cache + worker capture. Does NOT change playing."""
+    with cache_lock:
+        frame_cache.clear()
+        cache_state["cfg_key"] = ""
+        cache_state["epoch"] += 1
+    if _worker_cap["cap"] is not None:
+        _worker_cap["cap"].release()
+        _worker_cap["cap"] = None
+        _worker_cap["video"] = ""
+        _worker_cap["pos"] = -2
     runtime["cap"] = None
     runtime["active_video"] = ""
     runtime["frame_idx"] = -1
-    state["playing"] = False
+    runtime["total_frames"] = 0
 
 
 def ensure_capture_open():
+    """Validate that a video is selected and openable, and learn its fps/total."""
     selected_video = state["selected_video"]
     if not selected_video:
         runtime["last_error"] = "Choose a valid video."
         return False
-
-    if runtime["cap"] is not None and runtime["active_video"] == selected_video:
-        return True
-
-    release_capture()
-    cap = cv2.VideoCapture(selected_video)
-    if not cap.isOpened():
+    ensure_video_meta(selected_video)
+    if runtime["active_video"] != selected_video:
         runtime["last_error"] = "Failed to open selected video."
         return False
-
-    runtime["cap"] = cap
-    runtime["active_video"] = selected_video
-    runtime["total_frames"] = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    runtime["fps"] = fps if fps and fps > 1e-6 else 25.0
-    runtime["frame_idx"] = -1
-    runtime["displayed_count"] = 0
-    runtime["started_at"] = time.time()
     runtime["last_error"] = ""
     return True
 
 
-def run_ppe(frame, person_model, ppe_model, person_conf, ppe_conf, manual_boxes=None):
+_FONT = cv2.FONT_HERSHEY_SIMPLEX
+
+# Colors are BGR.
+COLOR_PERSON = (255, 170, 40)
+COLOR_PPE = (90, 220, 70)
+COLOR_SM = (80, 200, 255)
+COLOR_MANUAL = (235, 110, 200)
+COLOR_HUD_BG = (24, 26, 32)
+
+
+def sanitize_class_name(name: str) -> str:
+    """Make a class label safe to use as a folder name."""
+    cleaned = "".join(c if (c.isalnum() or c in (" ", "-", "_")) else "_" for c in str(name)).strip()
+    cleaned = cleaned.replace(" ", "_")
+    return cleaned or "unlabeled"
+
+
+def draw_label_chip(img, x, y, text, bg_color, fg_color=(20, 20, 22)):
+    """Draw a filled label chip whose bottom edge sits just above (x, y)."""
+    scale, thickness = 0.5, 1
+    (tw, th), baseline = cv2.getTextSize(text, _FONT, scale, thickness)
+    pad_x, pad_y = 6, 4
+    chip_w = tw + pad_x * 2
+    chip_h = th + baseline + pad_y * 2
+    cx = max(0, x)
+    cy = y - chip_h
+    if cy < 0:
+        cy = max(0, y)
+    cv2.rectangle(img, (cx, cy), (cx + chip_w, cy + chip_h), bg_color, -1, cv2.LINE_AA)
+    cv2.putText(
+        img, text, (cx + pad_x, cy + pad_y + th),
+        _FONT, scale, fg_color, thickness, cv2.LINE_AA,
+    )
+
+
+def draw_hud(img, lines, accent_color, align="left"):
+    """Draw a translucent stat panel with an accent bar in a top corner."""
+    if not lines:
+        return
+    scale, thickness = 0.58, 1
+    sizes = [cv2.getTextSize(t, _FONT, scale, thickness)[0] for t in lines]
+    max_w = max(s[0] for s in sizes)
+    line_h = max(s[1] for s in sizes)
+    pad, gap, bar = 10, 9, 6
+    panel_w = bar + pad + max_w + pad
+    panel_h = pad * 2 + len(lines) * line_h + (len(lines) - 1) * gap
+    y0 = 10
+    x0 = (img.shape[1] - panel_w - 10) if align == "right" else 10
+    x0 = max(0, x0)
+    overlay = img.copy()
+    cv2.rectangle(overlay, (x0, y0), (x0 + panel_w, y0 + panel_h), COLOR_HUD_BG, -1)
+    cv2.addWeighted(overlay, 0.6, img, 0.4, 0, img)
+    cv2.rectangle(img, (x0, y0), (x0 + bar, y0 + panel_h), accent_color, -1)
+    y = y0 + pad + line_h
+    for text in lines:
+        cv2.putText(
+            img, text, (x0 + bar + pad, y),
+            _FONT, scale, (236, 239, 245), thickness, cv2.LINE_AA,
+        )
+        y += line_h + gap
+
+
+def run_ppe(
+    frame,
+    person_model,
+    ppe_model,
+    person_conf,
+    ppe_conf,
+    manual_boxes=None,
+    ppe_inside_person=True,
+):
     annotated = frame.copy()
     h, w = frame.shape[:2]
     person_count = 0
@@ -197,24 +449,29 @@ def run_ppe(frame, person_model, ppe_model, person_conf, ppe_conf, manual_boxes=
     person_boxes = []
     manual_boxes = manual_boxes or []
 
+    def draw_ppe_box(gx1, gy1, gx2, gy2, label, bconf):
+        nonlocal ppe_count
+        gx1, gy1, gx2, gy2 = ppe_inference.clamp_box(gx1, gy1, gx2, gy2, w, h)
+        if gx2 <= gx1 or gy2 <= gy1:
+            return
+        ppe_count += 1
+        cv2.rectangle(annotated, (gx1, gy1), (gx2, gy2), COLOR_PPE, 2, cv2.LINE_AA)
+        draw_label_chip(annotated, gx1, gy1, f"{label} {bconf:.2f}", COLOR_PPE)
+
     def process_person_region(x1, y1, x2, y2, person_label):
-        nonlocal person_count, ppe_count
+        nonlocal person_count
         x1, y1, x2, y2 = ppe_inference.clamp_box(x1, y1, x2, y2, w, h)
         if x2 <= x1 or y2 <= y1:
             return
         person_count += 1
         person_boxes.append((x1, y1, x2, y2))
         person_idx = len(person_boxes)
-        cv2.rectangle(annotated, (x1, y1), (x2, y2), (255, 180, 0), 2)
-        cv2.putText(
-            annotated,
-            f"P{person_idx} {person_label}",
-            (x1, max(18, y1 - 8)),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (255, 180, 0),
-            2,
-        )
+        cv2.rectangle(annotated, (x1, y1), (x2, y2), COLOR_PERSON, 2, cv2.LINE_AA)
+        draw_label_chip(annotated, x1, y1, f"P{person_idx} {person_label}", COLOR_PERSON)
+
+        # When PPE is scoped to the person box, detect inside this crop only.
+        if not ppe_inside_person:
+            return
 
         crop = frame[y1:y2, x1:x2]
         if crop.size == 0:
@@ -229,23 +486,7 @@ def run_ppe(frame, person_model, ppe_model, person_conf, ppe_conf, manual_boxes=
             bcls = int(bbox.cls[0])
             label = ppe_result.names.get(bcls, str(bcls))
             cx1, cy1, cx2, cy2 = map(int, bbox.xyxy[0])
-            gx1, gy1 = x1 + cx1, y1 + cy1
-            gx2, gy2 = x1 + cx2, y1 + cy2
-            gx1, gy1, gx2, gy2 = ppe_inference.clamp_box(gx1, gy1, gx2, gy2, w, h)
-            if gx2 <= gx1 or gy2 <= gy1:
-                continue
-
-            ppe_count += 1
-            cv2.rectangle(annotated, (gx1, gy1), (gx2, gy2), (0, 255, 0), 2)
-            cv2.putText(
-                annotated,
-                f"{label} {bconf:.2f}",
-                (gx1, max(18, gy1 - 8)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.55,
-                (0, 255, 0),
-                2,
-            )
+            draw_ppe_box(x1 + cx1, y1 + cy1, x1 + cx2, y1 + cy2, label, bconf)
 
     # Force person-model stage to detect only "person" class.
     person_result = person_model.predict(
@@ -264,33 +505,45 @@ def run_ppe(frame, person_model, ppe_model, person_conf, ppe_conf, manual_boxes=
             pconf = float(pbox.conf[0])
             process_person_region(x1, y1, x2, y2, f"person {pconf:.2f}")
 
+    # Manual boxes are user-drawn class annotations: draw them with their own
+    # label/color, don't treat them as persons or run PPE inside them.
     for mb in manual_boxes:
         mx1, my1, mx2, my2 = map(int, mb[:4])
-        process_person_region(mx1, my1, mx2, my2, "manual")
+        cls_label = mb[4] if len(mb) > 4 and mb[4] else "manual"
+        mx1, my1, mx2, my2 = ppe_inference.clamp_box(mx1, my1, mx2, my2, w, h)
+        if mx2 <= mx1 or my2 <= my1:
+            continue
+        cv2.rectangle(annotated, (mx1, my1), (mx2, my2), COLOR_MANUAL, 2, cv2.LINE_AA)
+        draw_label_chip(annotated, mx1, my1, str(cls_label), COLOR_MANUAL, fg_color=(255, 255, 255))
 
-    cv2.putText(
+    # When disabled, run the PPE model once across the whole frame.
+    if not ppe_inside_person:
+        # The PPE model is trained on close-up person crops, so on a full frame
+        # its targets are tiny. Predict near native resolution (multiple of 32,
+        # capped) so small PPE objects are not shrunk away by the default imgsz.
+        ppe_imgsz = int(min(1920, max(640, ((max(h, w) + 31) // 32) * 32)))
+        ppe_result = ppe_model.predict(
+            frame, conf=ppe_conf, imgsz=ppe_imgsz, verbose=False
+        )[0]
+        if ppe_result.boxes is not None:
+            for bbox in ppe_result.boxes:
+                bconf = float(bbox.conf[0])
+                bcls = int(bbox.cls[0])
+                label = ppe_result.names.get(bcls, str(bcls))
+                gx1, gy1, gx2, gy2 = map(int, bbox.xyxy[0])
+                draw_ppe_box(gx1, gy1, gx2, gy2, label, bconf)
+
+    draw_hud(
         annotated,
-        f"PPE: persons={person_count}, ppe_boxes={ppe_count}",
-        (10, 28),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (0, 255, 255),
-        2,
+        [f"PPE  Persons: {person_count}", f"PPE items: {ppe_count}"],
+        COLOR_PPE,
     )
     return annotated, person_boxes
 
 
 def run_sm(frame, sm_model, sm_conf):
     annotated, det_count = sm_cropper.draw_detections(frame, sm_model, sm_conf)
-    cv2.putText(
-        annotated,
-        f"SM: detections={det_count}",
-        (10, 28),
-        cv2.FONT_HERSHEY_SIMPLEX,
-        0.7,
-        (0, 255, 255),
-        2,
-    )
+    draw_hud(annotated, [f"SM  Detections: {det_count}"], COLOR_SM, align="right")
     return annotated
 
 
@@ -328,58 +581,98 @@ def build_model_package_options_html(
     return "".join(options)
 
 
-def process_frame_to_jpg(frame):
-    try:
-        out = frame.copy()
-        runtime["last_raw_frame"] = frame.copy()
-        runtime["last_person_boxes"] = []
-        current_frame_idx = int(runtime.get("frame_idx", -1))
-        manual_boxes = runtime["manual_boxes_by_frame"].get(current_frame_idx, [])
-        ran_any = False
-        if (
-            state["person_model_path"] != NONE_MODEL_VALUE
-            and state["ppe_model_path"] != NONE_MODEL_VALUE
-        ):
-            person_model = get_or_load_model(state["person_model_path"])
-            ppe_model = get_or_load_model(state["ppe_model_path"])
-            out, person_boxes = run_ppe(
-                out,
-                person_model,
-                ppe_model,
-                float(state["person_conf"]),
-                float(state["ppe_conf"]),
-                manual_boxes=manual_boxes,
-            )
-            runtime["last_person_boxes"] = person_boxes
-            ran_any = True
+def snapshot_inference_cfg(frame_idx: int) -> dict:
+    """Copy just the settings the renderer needs. Caller must hold state_lock."""
+    return {
+        "person_model_path": state["person_model_path"],
+        "ppe_model_path": state["ppe_model_path"],
+        "sm_model_path": state["sm_model_path"],
+        "person_conf": float(state["person_conf"]),
+        "ppe_conf": float(state["ppe_conf"]),
+        "sm_conf": float(state["sm_conf"]),
+        "ppe_inside_person": bool(state["ppe_inside_person"]),
+        "manual_boxes": list(runtime["manual_boxes_by_frame"].get(frame_idx, [])),
+    }
 
-        if state["sm_model_path"] != NONE_MODEL_VALUE:
-            sm_model = get_or_load_model(state["sm_model_path"])
-            out = run_sm(out, sm_model, float(state["sm_conf"]))
-            ran_any = True
+
+def annotate_frame(frame, cfg: dict):
+    """
+    Run inference and annotate a single frame, returning the annotated BGR image.
+    Touches no shared state, so it can run WITHOUT state_lock; the heavy predicts
+    are serialized by inference_lock.
+    Returns (annotated_bgr_or_None, person_boxes, error_or_None).
+    """
+    out = frame.copy()
+    person_boxes = []
+    try:
+        with inference_lock:
+            ran_any = False
+            if (
+                cfg["person_model_path"] != NONE_MODEL_VALUE
+                and cfg["ppe_model_path"] != NONE_MODEL_VALUE
+            ):
+                person_model = get_or_load_model(cfg["person_model_path"])
+                ppe_model = get_or_load_model(cfg["ppe_model_path"])
+                out, person_boxes = run_ppe(
+                    out,
+                    person_model,
+                    ppe_model,
+                    cfg["person_conf"],
+                    cfg["ppe_conf"],
+                    manual_boxes=cfg["manual_boxes"],
+                    ppe_inside_person=cfg["ppe_inside_person"],
+                )
+                ran_any = True
+
+            if cfg["sm_model_path"] != NONE_MODEL_VALUE:
+                sm_model = get_or_load_model(cfg["sm_model_path"])
+                out = run_sm(out, sm_model, cfg["sm_conf"])
+                ran_any = True
 
         if not ran_any:
-            cv2.putText(
-                out,
-                "No model selected (all set to None)",
-                (10, 28),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.7,
-                (0, 200, 255),
-                2,
-            )
+            draw_hud(out, ["No model selected", "(all set to None)"], (60, 170, 255))
     except Exception as exc:
-        runtime["last_error"] = f"Inference error: {exc}"
-        state["playing"] = False
-        return runtime["last_jpg"]
+        return None, [], f"Inference error: {exc}"
+
+    return out, person_boxes, None
+
+
+def render_annotated(frame, cfg: dict):
+    """
+    Annotate a frame and JPEG-encode it for the MJPEG stream.
+    Returns (jpg_bytes_or_None, person_boxes, raw_frame, error_or_None).
+    """
+    raw = frame.copy()
+    out, person_boxes, error = annotate_frame(frame, cfg)
+    if error:
+        return None, [], raw, error
 
     ok, buf = cv2.imencode(".jpg", out)
     if not ok:
-        return runtime["last_jpg"]
+        return None, person_boxes, raw, None
+    return buf.tobytes(), person_boxes, raw, None
 
-    runtime["displayed_count"] += 1
-    runtime["last_jpg"] = buf.tobytes()
+
+def commit_render(jpg, person_boxes, raw, error):
+    """Write render results into runtime. Caller must hold state_lock."""
+    if error:
+        runtime["last_error"] = error
+        state["playing"] = False
+        return runtime["last_jpg"]
+    runtime["last_raw_frame"] = raw
+    runtime["last_person_boxes"] = person_boxes
+    if jpg is not None:
+        runtime["last_jpg"] = jpg
+        runtime["displayed_count"] += 1
     return runtime["last_jpg"]
+
+
+def process_frame_to_jpg(frame):
+    """Synchronous render+commit used by seek/crop paths (caller holds state_lock)."""
+    frame_idx = int(runtime.get("frame_idx", -1))
+    cfg = snapshot_inference_cfg(frame_idx)
+    jpg, person_boxes, raw, error = render_annotated(frame, cfg)
+    return commit_render(jpg, person_boxes, raw, error)
 
 
 def save_frame_image(frame, subdir: str, suffix: str = "") -> str:
@@ -419,7 +712,7 @@ def save_person_crop(person_index: int) -> str:
     return save_frame_image(crop, "person", suffix=f"person_{person_index}")
 
 
-def save_person_crop_from_box(box, suffix: str = "person_manual") -> str:
+def save_person_crop_from_box(box, suffix: str = "person_manual", subdir: str = "person") -> str:
     frame = runtime["last_raw_frame"]
     if frame is None:
         raise ValueError("No frame available for person crop.")
@@ -434,10 +727,12 @@ def save_person_crop_from_box(box, suffix: str = "person_manual") -> str:
     crop = frame[y1:y2, x1:x2]
     if crop.size == 0:
         raise ValueError("Empty crop generated.")
-    return save_frame_image(crop, "person", suffix=suffix)
+    return save_frame_image(crop, subdir, suffix=suffix)
 
 
-def add_manual_box_for_current_frame(x1_ratio: float, y1_ratio: float, x2_ratio: float, y2_ratio: float):
+def add_manual_box_for_current_frame(
+    x1_ratio: float, y1_ratio: float, x2_ratio: float, y2_ratio: float, class_name: str = "manual"
+):
     frame = runtime["last_raw_frame"]
     if frame is None:
         raise ValueError("No frame loaded yet.")
@@ -453,7 +748,7 @@ def add_manual_box_for_current_frame(x1_ratio: float, y1_ratio: float, x2_ratio:
     y1, y2 = sorted((y1, y2))
     if (x2 - x1) < 4 or (y2 - y1) < 4:
         raise ValueError("Manual box is too small.")
-    box = (x1, y1, x2, y2)
+    box = (x1, y1, x2, y2, str(class_name))
     runtime["manual_boxes_by_frame"].setdefault(frame_idx, []).append(box)
     return box, frame_idx
 
@@ -482,71 +777,155 @@ def save_person_crop_from_point(x_ratio: float, y_ratio: float) -> str:
     return save_person_crop(chosen_idx)
 
 
-def seek_to_frame(target_idx: int):
-    if not ensure_capture_open():
-        return False
-    cap = runtime["cap"]
-    total = max(int(runtime["total_frames"]), 0)
-    if total > 0:
-        target_idx = max(0, min(int(target_idx), total - 1))
-    else:
-        target_idx = max(0, int(target_idx))
+def _show_cached(idx, jpg, boxes, advance=True):
+    """Make a cached frame the currently-displayed one. Caller must NOT hold locks."""
+    with state_lock:
+        runtime["frame_idx"] = idx
+        runtime["last_person_boxes"] = boxes
+        runtime["last_raw_frame"] = None  # fetched on demand for crops
+        if jpg is not None:
+            runtime["last_jpg"] = jpg
+            if advance:
+                runtime["displayed_count"] += 1
+        runtime["last_error"] = ""
 
-    cap.set(cv2.CAP_PROP_POS_FRAMES, target_idx)
-    ok, frame = cap.read()
-    if not ok or frame is None:
+
+def seek_to_frame(target_idx: int):
+    """Jump to a frame. Instant if already annotated (cached); otherwise render it
+    once and cache it. Never clears other cached frames. Hold no lock when calling."""
+    with state_lock:
+        video = state["selected_video"]
+        step = max(int(state["frame_step"]), 1)
+        cfg_key = compute_cfg_key()
+    if not video:
+        runtime["last_error"] = "Choose a valid video."
+        return False
+    ensure_video_meta(video)
+    total = max(int(runtime["total_frames"]), 0)
+    target_idx = max(0, min(int(target_idx), total - 1)) if total > 0 else max(0, int(target_idx))
+    target_idx = (target_idx // step) * step  # snap to the step grid (shared with the worker)
+
+    # Already annotated? Show instantly (and keep everything else cached).
+    with cache_lock:
+        cache_sync_cfg(cfg_key)
+        cache_state["fill_cursor"] = target_idx  # background fill follows the seek
+        cached = cache_get(target_idx)
+        epoch = cache_state["epoch"]
+    if cached is not None:
+        _show_cached(target_idx, cached[0], cached[1])
+        return True
+
+    # First visit to this frame under the current config: render once and cache it.
+    frame = read_raw_frame(video, target_idx)
+    if frame is None:
         runtime["last_error"] = "Unable to seek to requested frame."
         return False
-
-    runtime["frame_idx"] = max(0, int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1)
-    process_frame_to_jpg(frame)
+    with state_lock:
+        cfg = snapshot_inference_cfg(target_idx)
+    jpg, person_boxes, raw, error = render_annotated(frame, cfg)
+    if error:
+        runtime["last_error"] = error
+        return False
+    with cache_lock:
+        if cache_state["epoch"] == epoch and jpg is not None:
+            cache_put(target_idx, jpg, person_boxes)
+    _show_cached(target_idx, jpg, person_boxes)
     return True
 
 
-def next_frame_jpg():
-    if not state["playing"]:
-        return runtime["last_jpg"]
-    if not ensure_capture_open():
-        return runtime["last_jpg"]
+def prerender_worker():
+    """
+    Always-on background producer: whenever a video is selected (playing OR paused),
+    find the nearest frame ahead of the playhead that is NOT yet annotated and
+    annotate it — at most once per config. Already-cached frames are never redone.
+    """
+    while True:
+        with state_lock:
+            video = state["selected_video"]
+            step = max(int(state["frame_step"]), 1)
+            cfg_key = compute_cfg_key()
+            playhead = runtime["frame_idx"] if runtime["frame_idx"] >= 0 else 0
 
-    cap = runtime["cap"]
-    frame_step = max(int(state["frame_step"]), 1)
-    current = None
-    ok = False
-    for _ in range(frame_step):
-        ok, frame = cap.read()
-        if not ok:
-            break
-        current = frame
-        runtime["frame_idx"] = max(0, int(cap.get(cv2.CAP_PROP_POS_FRAMES)) - 1)
+        if not video:
+            time.sleep(0.1)
+            continue
+        ensure_video_meta(video)
+        total = max(int(runtime["total_frames"]), 0)
 
-    if not ok or current is None:
-        state["playing"] = False
-        return runtime["last_jpg"]
+        with cache_lock:
+            epoch = cache_sync_cfg(cfg_key)
+            nxt, new_cursor = pick_next_to_annotate(
+                playhead, step, total, cache_state["fill_cursor"]
+            )
+            cache_state["fill_cursor"] = new_cursor
 
-    return process_frame_to_jpg(current)
+        if nxt is None:
+            time.sleep(0.05)  # whole video loaded (or memory cap reached)
+            continue
+
+        frame = worker_read(video, nxt)
+        if frame is None:
+            time.sleep(0.05)  # transient read failure / past end; try again later
+            continue
+
+        with state_lock:
+            cfg = snapshot_inference_cfg(nxt)
+        jpg, person_boxes, raw, error = render_annotated(frame, cfg)
+        with cache_lock:
+            if cache_state["epoch"] != epoch:
+                continue  # config changed mid-render; discard
+            if not error and jpg is not None:
+                cache_put(nxt, jpg, person_boxes)
 
 
 def mjpeg_generator():
+    """Consumer: display cached frames, advancing at playback pace while playing."""
     while True:
         with state_lock:
-            jpg = next_frame_jpg()
+            playing = bool(state["playing"])
             realtime = bool(state["simulate_realtime"])
             fps = float(runtime["fps"]) if runtime["fps"] > 0 else 25.0
-            frame_step = max(int(state["frame_step"]), 1)
-            playing = bool(state["playing"])
+            step = max(int(state["frame_step"]), 1)
+            cur = runtime["frame_idx"]
+            total = max(int(runtime["total_frames"]), 0)
+            out_jpg = runtime["last_jpg"]
 
-        if jpg is not None:
+        advanced = False
+        if playing:
+            nxt = 0 if cur < 0 else cur + step
+            if total > 0 and nxt > total - 1:
+                with state_lock:
+                    state["playing"] = False  # reached the end
+            else:
+                with cache_lock:
+                    item = cache_get(nxt)
+                if item is not None:
+                    _show_cached(nxt, item[0], item[1])
+                    out_jpg = item[0] if item[0] is not None else out_jpg
+                    advanced = True
+                # else: not annotated yet — wait briefly for the worker.
+        elif out_jpg is None:
+            # Paused with nothing shown yet: preview the earliest cached frame.
+            with cache_lock:
+                if frame_cache:
+                    k = min(frame_cache)
+                    item = frame_cache[k]
+                else:
+                    k, item = None, None
+            if item is not None:
+                _show_cached(k, item[0], item[1], advance=False)
+                out_jpg = item[0] if item[0] is not None else out_jpg
+
+        if out_jpg is not None:
             yield (
                 b"--frame\r\n"
-                b"Content-Type: image/jpeg\r\n\r\n" + jpg + b"\r\n"
+                b"Content-Type: image/jpeg\r\n\r\n" + out_jpg + b"\r\n"
             )
 
-        if playing and realtime:
-            delay = max(0.0, (frame_step / fps) * 0.6)
-            time.sleep(delay)
+        if playing and realtime and advanced:
+            time.sleep(max(0.0, (step / fps) * DISPLAY_PACE_FACTOR))
         else:
-            time.sleep(0.05)
+            time.sleep(0.02 if playing else 0.05)
 
 
 @app.get("/")
@@ -555,7 +934,6 @@ def index():
         videos = list_videos(state["video_folder"])
         if state["selected_video"] not in videos:
             state["selected_video"] = videos[0] if videos else ""
-            save_settings()
         all_pt = discover_pt_models([str(MODELS_DIR)])
         packages = discover_model_packages(MODELS_DIR)
         package_paths = [p for _, p in packages]
@@ -585,6 +963,9 @@ def index():
         discovered_models_text = (
             os.linesep.join(discovered_lines) if discovered_lines else "No model packages in models/"
         )
+        # Persist the validated/normalized selections so the file always matches
+        # exactly what the page shows (and self-heals stale paths).
+        save_settings()
 
     page_html = f"""
 <!doctype html>
@@ -593,124 +974,170 @@ def index():
   <meta charset="utf-8" />
   <title>{APP_TITLE}</title>
   <style>
+    :root {{
+      --bg: #0f1115; --panel: #161a22; --panel-2: #1a1d24;
+      --border: #2b3140; --border-2: #3a4150;
+      --text: #eef1f6; --muted: #9aa4b4; --accent: #5f89ff; --accent-2: #38bdf8;
+    }}
     * {{ box-sizing: border-box; }}
-    body {{ font-family: Arial, sans-serif; margin: 0; background: #0f1115; color: #eee; }}
-    .wrap {{ padding: 16px; max-width: 1800px; margin: 0 auto; }}
-    .title {{ margin: 0 0 12px 0; font-size: 22px; }}
-    .layout {{ display: grid; grid-template-columns: minmax(0, 3.2fr) minmax(300px, 1fr); gap: 12px; align-items: start; }}
+    html, body {{ height: 100%; }}
+    body {{
+      font-family: 'Segoe UI', system-ui, Arial, sans-serif;
+      margin: 0; background: var(--bg); color: var(--text);
+      overflow: hidden;
+    }}
+    ::-webkit-scrollbar {{ width: 8px; height: 8px; }}
+    ::-webkit-scrollbar-thumb {{ background: #2b3140; border-radius: 8px; }}
+
+    .app {{
+      height: 100vh; display: flex; flex-direction: column;
+      padding: 10px 14px; gap: 10px;
+    }}
+    .topbar {{ display: flex; align-items: center; justify-content: space-between; flex: 0 0 auto; gap: 12px; }}
+    .title {{ margin: 0; font-size: 17px; font-weight: 600; letter-spacing: .2px; }}
+    .topbar .meta {{ flex: 1 1 auto; min-width: 0; text-align: right; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+
+    .layout {{
+      flex: 1 1 auto; min-height: 0;
+      display: grid; grid-template-columns: minmax(0, 1fr) 360px; gap: 12px;
+    }}
     .layout.right-hidden {{ grid-template-columns: 1fr 0; }}
     .layout.right-hidden .right-col {{ display: none; }}
-    .left-col {{ min-width: 0; }}
-    .right-col {{ min-width: 0; }}
+    .left-col {{ min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 10px; }}
+    .right-col {{ min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: 10px; overflow: hidden; }}
+
     .right-toggle {{
-      position: fixed;
-      top: 14px;
-      right: 14px;
-      z-index: 1000;
-      width: auto;
-      min-height: 34px;
-      padding: 6px 10px;
-      border-radius: 8px;
-      background: #111827;
-      border: 1px solid #334155;
+      width: auto; min-height: 32px; padding: 6px 12px; flex: 0 0 auto;
+      border-radius: 8px; background: #1c2330; border: 1px solid #334155; font-size: 13px;
     }}
-    .panel {{ border: 1px solid #2f3440; border-radius: 10px; background: #161a22; padding: 12px; margin-bottom: 12px; }}
-    .panel-title {{ margin: 0 0 10px 0; color: #cdd5e1; font-size: 14px; letter-spacing: .2px; }}
-    .grid-4 {{ display: grid; grid-template-columns: 1fr; gap: 10px; }}
-    .grid-5 {{ display: grid; grid-template-columns: 1fr; gap: 10px; }}
-    .nav-grid {{ display: grid; grid-template-columns: repeat(5, minmax(120px, 1fr)); gap: 10px; }}
-    .item {{ display: flex; flex-direction: column; gap: 6px; }}
-    .item label {{ color: #aeb6c4; font-size: 12px; }}
-    input, select, button {{
-      width: 100%;
-      min-height: 36px;
-      padding: 8px 10px;
-      background: #1a1d24;
-      color: #eee;
-      border: 1px solid #3a4150;
-      border-radius: 6px;
-      outline: none;
+
+    .panel {{ border: 1px solid var(--border); border-radius: 10px; background: var(--panel); padding: 11px; }}
+    .panel-title {{ margin: 0 0 9px 0; color: #cdd5e1; font-size: 12px; letter-spacing: .4px; text-transform: uppercase; font-weight: 600; }}
+
+    /* Video panel grows to fill remaining height; nav stays compact. */
+    .video-panel {{ flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; padding: 8px; }}
+    .video-wrap {{ position: relative; flex: 1 1 auto; min-height: 0; display: flex; }}
+    .video {{
+      background: #000; border: 1px solid #2b3140; border-radius: 8px;
+      width: 100%; height: 100%; object-fit: contain; display: block; cursor: default;
     }}
-    input:focus, select:focus {{ border-color: #5f89ff; }}
-    button {{ cursor: pointer; font-weight: 600; }}
-    .btn-start {{ background: #1b5e20; border-color: #2e7d32; }}
-    .btn-pause {{ background: #7b4f00; border-color: #9a6b08; }}
-    .btn-stop {{ background: #7f1d1d; border-color: #991b1b; }}
-    .btn-crop {{ background: #1f2937; border-color: #374151; }}
-    .video-wrap {{ position: relative; }}
-    .video {{ background: #000; border: 1px solid #333; border-radius: 8px; width: 100%; max-height: 80vh; height: auto; display: block; cursor: default; }}
     .video.pick-mode {{ cursor: crosshair; }}
+    .nav-panel {{ flex: 0 0 auto; }}
+
+    .grid-2 {{ display: grid; grid-template-columns: 1fr 1fr; gap: 9px; }}
+    .grid-3 {{ display: grid; grid-template-columns: repeat(3, 1fr); gap: 9px; }}
+    .stack {{ display: flex; flex-direction: column; gap: 9px; }}
+    .sub-label {{ font-size: 11px; color: var(--muted); margin: 2px 0 -2px; }}
+    input[type=checkbox] {{ width: 16px; height: 16px; min-height: 0; accent-color: var(--accent); }}
+    .toggle-row {{
+      display: flex; align-items: center; gap: 9px; cursor: pointer;
+      background: var(--panel-2); border: 1px solid var(--border-2);
+      border-radius: 6px; padding: 8px 10px; font-size: 13px;
+    }}
+    .toggle-row:hover {{ border-color: var(--accent); }}
+    .transport {{ display: flex; align-items: center; justify-content: center; gap: 10px; }}
+    .seek-row {{ display: flex; align-items: center; gap: 10px; margin-top: 12px; }}
+    .time-readout {{ font-variant-numeric: tabular-nums; font-size: 12px; color: var(--muted); white-space: nowrap; }}
+    /* Seek slider with a buffered-ahead indicator behind the thumb. */
+    .slider-wrap {{ position: relative; flex: 1 1 auto; height: 36px; display: flex; align-items: center; }}
+    .slider-wrap input[type=range] {{ position: relative; z-index: 3; width: 100%; }}
+    .slider-wrap input[type=range]::-webkit-slider-runnable-track {{ background: transparent; }}
+    .slider-wrap input[type=range]::-moz-range-track {{ background: transparent; }}
+    .seek-track {{ position: absolute; left: 0; right: 0; top: 50%; transform: translateY(-50%);
+                   height: 5px; border-radius: 4px; background: #2b3140; overflow: hidden; z-index: 0; }}
+    .seek-seg {{ position: absolute; top: 0; height: 100%; background: #6b7280; }}
+    .seek-played {{ position: absolute; left: 0; top: 0; height: 100%; width: 0%;
+                    background: var(--accent); transition: width .1s linear; }}
+    .buffer-pill {{ font-size: 11px; color: var(--muted); white-space: nowrap; min-width: 84px; text-align: right; }}
+    .buffer-pill.ready {{ color: #6ee7a8; }}
+    .item {{ display: flex; flex-direction: column; gap: 5px; min-width: 0; }}
+    .item label {{ color: var(--muted); font-size: 11px; }}
+
+    input, select, button {{
+      width: 100%; min-height: 34px; padding: 7px 9px;
+      background: var(--panel-2); color: var(--text);
+      border: 1px solid var(--border-2); border-radius: 6px; outline: none;
+      font-size: 13px; transition: border-color .12s, background .12s, transform .04s;
+    }}
+    input:focus, select:focus {{ border-color: var(--accent); box-shadow: 0 0 0 2px rgba(95,137,255,.15); }}
+    button {{ cursor: pointer; font-weight: 600; }}
+    button:hover {{ filter: brightness(1.18); }}
+    button:active {{ transform: translateY(1px); }}
+
+    /* Transport controls */
+    .t-btn {{
+      width: auto; min-width: 78px; min-height: 40px; padding: 6px 14px;
+      background: #232b3a; border: 1px solid #374151; border-radius: 8px;
+      color: var(--text); font-size: 13px;
+      display: inline-flex; align-items: center; justify-content: center; gap: 5px;
+    }}
+    .play-btn {{
+      width: 54px; min-width: 54px; height: 54px; min-height: 54px; flex: 0 0 auto; padding: 0;
+      border-radius: 50%; border: none; color: #fff;
+      background: linear-gradient(145deg, #22c55e, #16a34a);
+      box-shadow: 0 5px 16px rgba(22, 163, 74, .42);
+      display: inline-flex; align-items: center; justify-content: center;
+      transition: filter .12s, transform .08s, background .15s, box-shadow .15s;
+    }}
+    .play-btn.playing {{ background: linear-gradient(145deg, #f59e0b, #d97706); box-shadow: 0 5px 16px rgba(217, 119, 6, .42); }}
+    .play-btn:hover {{ filter: brightness(1.08); transform: translateY(-1px); }}
+    .play-btn:active {{ transform: translateY(0); }}
+    .play-btn svg {{ display: block; }}
+    .btn-crop {{ background: #232b3a; border-color: #374151; }}
+    .btn-crop.active {{ background: #0b4f6c; border-color: var(--accent-2); color: #e0f7ff; }}
+
     .video-actions {{
-      position: absolute;
-      top: 12px;
-      right: 12px;
-      display: flex;
-      flex-direction: column;
-      gap: 8px;
-      width: 132px;
-      z-index: 10;
+      position: absolute; top: 10px; right: 10px; z-index: 10;
+      display: flex; flex-direction: column; gap: 7px; width: 124px;
     }}
-    .video-actions button {{ min-height: 34px; }}
-    .draw-overlay {{
-      position: absolute;
-      inset: 0;
-      z-index: 8;
-      display: none;
-      cursor: crosshair;
-    }}
+    .video-actions button {{ min-height: 32px; font-size: 12px; opacity: .92; }}
+    .video-actions button:hover {{ opacity: 1; }}
+
+    .draw-overlay {{ position: absolute; inset: 0; z-index: 8; display: none; cursor: crosshair; }}
     .draw-box {{
-      position: absolute;
-      border: 2px solid #38bdf8;
-      background: rgba(56, 189, 248, 0.15);
-      pointer-events: none;
-      display: none;
+      position: absolute; border: 2px solid var(--accent-2);
+      background: rgba(56, 189, 248, 0.15); pointer-events: none; display: none;
     }}
     .video-note {{
-      margin-top: 4px;
-      font-size: 12px;
-      color: #e5e7eb;
-      background: rgba(17, 24, 39, 0.85);
-      border: 1px solid #374151;
-      border-radius: 6px;
-      padding: 6px 8px;
-      display: none;
+      position: absolute; left: 10px; bottom: 10px; z-index: 11; max-width: 70%;
+      font-size: 12px; color: #e5e7eb; background: rgba(17, 24, 39, 0.88);
+      border: 1px solid #374151; border-radius: 6px; padding: 6px 9px; display: none;
     }}
+
+    /* Range slider styling */
+    input[type=range] {{ -webkit-appearance: none; appearance: none; padding: 0; height: 18px; background: transparent; }}
+    input[type=range]::-webkit-slider-runnable-track {{ height: 5px; border-radius: 4px; background: #2b3140; }}
+    input[type=range]::-moz-range-track {{ height: 5px; border-radius: 4px; background: #2b3140; }}
+    input[type=range]::-webkit-slider-thumb {{ -webkit-appearance: none; margin-top: -5px; width: 15px; height: 15px; border-radius: 50%; background: var(--accent); border: none; cursor: pointer; }}
+    input[type=range]::-moz-range-thumb {{ width: 15px; height: 15px; border-radius: 50%; background: var(--accent); border: none; cursor: pointer; }}
+
     .toast {{
-      position: fixed;
-      left: 50%;
-      bottom: 18px;
-      transform: translateX(-50%);
-      background: rgba(22, 163, 74, 0.95);
-      color: #fff;
-      border: 1px solid #15803d;
-      border-radius: 8px;
-      padding: 8px 12px;
-      font-size: 13px;
-      z-index: 2000;
-      display: none;
+      position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%) translateY(8px);
+      background: rgba(22, 163, 74, 0.96); color: #fff; border: 1px solid #15803d;
+      border-radius: 8px; padding: 9px 14px; font-size: 13px; font-weight: 600;
+      z-index: 2000; opacity: 0; pointer-events: none; transition: opacity .15s, transform .15s;
     }}
-    .toast.error {{
-      background: rgba(153, 27, 27, 0.95);
-      border-color: #b91c1c;
-    }}
-    .meta {{ font-size: 13px; color: #bbb; }}
-    .list {{ font-size: 12px; color: #aaa; white-space: pre-wrap; margin-top: 8px; }}
-    @media (max-width: 1200px) {{
-      .layout {{ grid-template-columns: 1fr; }}
-      .grid-4 {{ grid-template-columns: 1fr; }}
-      .grid-5 {{ grid-template-columns: 1fr; }}
-      .nav-grid {{ grid-template-columns: repeat(2, minmax(220px, 1fr)); }}
+    .toast.show {{ opacity: 1; transform: translateX(-50%) translateY(0); }}
+    .toast.error {{ background: rgba(153, 27, 27, 0.96); border-color: #b91c1c; }}
+
+    .meta {{ font-size: 12px; color: #aeb6c4; }}
+    .list {{ font-size: 11px; color: #97a0b0; white-space: pre-wrap; overflow: auto; max-height: 110px; line-height: 1.5; }}
+
+    @media (max-width: 1100px) {{
+      .layout {{ grid-template-columns: minmax(0, 1fr) 320px; }}
     }}
   </style>
 </head>
 <body>
-  <div class="wrap">
-    <h3 class="title">{APP_TITLE}</h3>
-    <button id="right_toggle_btn" class="right-toggle" onclick="toggleRightPanel()">Hide Panel</button>
+  <div class="app">
+    <div class="topbar">
+      <h3 class="title">{APP_TITLE}</h3>
+      <div class="meta" id="meta">Loading...</div>
+      <button id="right_toggle_btn" class="right-toggle" onclick="toggleRightPanel()">Hide Panel</button>
+    </div>
     <div class="layout" id="main_layout">
       <div class="left-col">
-        <div class="panel">
-          <div class="panel-title">Video</div>
+        <div class="panel video-panel">
           <div class="video-wrap">
             <img id="video_stream" class="video" src="/stream.mjpg" />
             <div id="draw_overlay" class="draw-overlay">
@@ -721,28 +1148,32 @@ def index():
               <button class="btn-crop" onclick="cropFrame()">Frame (F)</button>
               <button class="btn-crop" onclick="cropBackground()">Background (B)</button>
               <button id="crop_manual_btn" class="btn-crop" onclick="toggleManualMode()">Manual (M)</button>
-              <button id="crop_cancel_btn" class="btn-crop" style="display:none;" onclick="closePersonCrop()">X</button>
-              <div id="video_action_note" class="video-note"></div>
+              <button id="crop_cancel_btn" class="btn-crop" style="display:none;" onclick="closePersonCrop()">Cancel (Esc)</button>
+              <button id="download_video_btn" class="btn-crop" onclick="downloadInferenceVideo()" title="Render the whole video with detections and download it">&#11015; Download Video</button>
             </div>
+            <div id="video_action_note" class="video-note"></div>
           </div>
         </div>
 
-        <div class="panel">
-          <div class="panel-title">Video Navigation</div>
-          <div class="nav-grid">
-            <div class="item"><label>&nbsp;</label><button onclick="seekBy(-5, 'sec')">-5 sec</button></div>
-            <div class="item"><label>&nbsp;</label><button onclick="seekBy(-1, 'frame')">-1 frame</button></div>
-            <div class="item"><label>&nbsp;</label><button id="play_pause_btn" onclick="togglePlayPause()">&#9658;</button></div>
-            <div class="item"><label>&nbsp;</label><button onclick="seekBy(1, 'frame')">+1 frame</button></div>
-            <div class="item"><label>&nbsp;</label><button onclick="seekBy(5, 'sec')">+5 sec</button></div>
+        <div class="panel nav-panel">
+          <div class="transport">
+            <button class="t-btn" onclick="seekBy(-5, 'sec')" title="Back 5 seconds">&#171; 5s</button>
+            <button class="t-btn" onclick="seekBy(-1, 'frame')" title="Previous frame (Left Arrow)">&#8249; Frame</button>
+            <button id="play_pause_btn" class="play-btn" onclick="togglePlayPause()" title="Play / Pause (Space)" aria-label="Play/Pause"></button>
+            <button class="t-btn" onclick="seekBy(1, 'frame')" title="Next frame (Right Arrow)">Frame &#8250;</button>
+            <button class="t-btn" onclick="seekBy(5, 'sec')" title="Forward 5 seconds">5s &#187;</button>
           </div>
-          <div class="item" style="margin-top: 10px;">
-            <label for="seek_slider">Dragger (frame seek)</label>
-            <input id="seek_slider" type="range" min="0" max="0" step="1" value="0" />
-          </div>
-          <div class="item" style="margin-top: 10px;">
-            <label>Status</label>
-            <div class="meta" id="meta">Loading...</div>
+          <div class="seek-row">
+            <span class="time-readout" id="time_cur">0:00</span>
+            <div class="slider-wrap">
+              <div class="seek-track">
+                <div id="seek_buffers"></div>
+                <div class="seek-played" id="seek_played"></div>
+              </div>
+              <input id="seek_slider" type="range" min="0" max="0" step="1" value="0" title="Drag to seek" />
+            </div>
+            <span class="time-readout" id="time_total">0:00</span>
+            <span class="buffer-pill" id="buffer_pill"></span>
           </div>
         </div>
 
@@ -750,31 +1181,34 @@ def index():
 
       <div class="right-col">
         <div class="panel">
-          <div class="panel-title">Model Configuration</div>
-          <div class="grid-4">
-            <div class="item"><label for="person_model_path">Person model path</label><select id="person_model_path">{person_model_options_html}</select></div>
-            <div class="item"><label for="ppe_model_path">PPE model path</label><select id="ppe_model_path">{ppe_model_options_html}</select></div>
-            <div class="item"><label for="sm_model_path">SM model path</label><select id="sm_model_path">{sm_model_options_html}</select></div>
-            <div class="item"><label>Models directory</label><input value="{html.escape(str(MODELS_DIR), quote=True)}" disabled /></div>
+          <div class="panel-title">Models</div>
+          <div class="stack">
+            <div class="item"><label for="person_model_path">Person model</label><select id="person_model_path">{person_model_options_html}</select></div>
+            <div class="item"><label for="ppe_model_path">PPE model</label><select id="ppe_model_path">{ppe_model_options_html}</select></div>
+            <div class="item"><label for="sm_model_path">SM model</label><select id="sm_model_path">{sm_model_options_html}</select></div>
+            <label class="toggle-row" for="ppe_inside_person"><input id="ppe_inside_person" type="checkbox" {"checked" if state["ppe_inside_person"] else ""} />Detect PPE only inside person box</label>
           </div>
         </div>
 
         <div class="panel">
-          <div class="panel-title">Playback and Thresholds</div>
-          <div class="grid-4">
+          <div class="panel-title">Source &amp; Playback</div>
+          <div class="stack">
             <div class="item"><label for="video_folder">Video folder</label><input id="video_folder" value="{state["video_folder"]}" /></div>
             <div class="item"><label for="selected_video">Video file</label><select id="selected_video"></select></div>
-            <div class="item"><label for="person_conf">Person conf</label><input id="person_conf" type="number" min="0" max="1" step="0.05" value="{state["person_conf"]}" /></div>
-            <div class="item"><label for="ppe_conf">PPE conf</label><input id="ppe_conf" type="number" min="0" max="1" step="0.05" value="{state["ppe_conf"]}" /></div>
-          </div>
-          <div class="grid-5" style="margin-top: 10px;">
-            <div class="item"><label for="sm_conf">SM conf</label><input id="sm_conf" type="number" min="0" max="1" step="0.05" value="{state["sm_conf"]}" /></div>
-            <div class="item"><label for="frame_step">Frame step</label><input id="frame_step" type="number" min="1" max="60" step="1" value="{state["frame_step"]}" /></div>
-            <div class="item"><label for="simulate_realtime">Realtime</label><select id="simulate_realtime"><option value="true" {"selected" if state["simulate_realtime"] else ""}>Enabled</option><option value="false" {"selected" if not state["simulate_realtime"] else ""}>Disabled</option></select></div>
+            <div class="sub-label">Confidence thresholds</div>
+            <div class="grid-3">
+              <div class="item"><label for="person_conf">Person</label><input id="person_conf" type="number" min="0" max="1" step="0.05" value="{state["person_conf"]}" /></div>
+              <div class="item"><label for="ppe_conf">PPE</label><input id="ppe_conf" type="number" min="0" max="1" step="0.05" value="{state["ppe_conf"]}" /></div>
+              <div class="item"><label for="sm_conf">SM</label><input id="sm_conf" type="number" min="0" max="1" step="0.05" value="{state["sm_conf"]}" /></div>
+            </div>
+            <div class="grid-2">
+              <div class="item"><label for="frame_step">Frame step</label><input id="frame_step" type="number" min="1" max="60" step="1" value="{state["frame_step"]}" /></div>
+              <div class="item"><label for="simulate_realtime">Realtime</label><select id="simulate_realtime"><option value="true" {"selected" if state["simulate_realtime"] else ""}>Enabled</option><option value="false" {"selected" if not state["simulate_realtime"] else ""}>Disabled</option></select></div>
+            </div>
           </div>
         </div>
 
-        <div class="panel">
+        <div class="panel" style="min-height:0;display:flex;flex-direction:column;">
           <div class="panel-title">Discovered Models</div>
           <div class="list">{html.escape(discovered_models_text)}</div>
         </div>
@@ -786,6 +1220,8 @@ def index():
   let allVideos = {json.dumps(videos)};
   let selectedVideo = {json.dumps(state["selected_video"])};
   let suppressSliderUpdate = false;
+  let uiPlaying = false;           // optimistic play state for instant button feedback
+  let controlPendingUntil = 0;     // ignore stale poll results until this time
   let personPickMode = false;
   let manualDrawMode = false;
   let drawStart = null;
@@ -821,6 +1257,7 @@ def index():
       sm_conf: Number(document.getElementById("sm_conf").value),
       frame_step: Number(document.getElementById("frame_step").value),
       simulate_realtime: document.getElementById("simulate_realtime").value === "true",
+      ppe_inside_person: document.getElementById("ppe_inside_person").checked,
     }};
   }}
 
@@ -835,24 +1272,32 @@ def index():
     selectedVideo = data.selected_video || selectedVideo;
   }}
 
-  async function control(action) {{
-    await fetch("/api/control", {{
+  // Fire-and-forget control (don't block the UI on the round-trip).
+  function control(action) {{
+    fetch("/api/control", {{
       method: "POST",
       headers: {{ "Content-Type": "application/json" }},
       body: JSON.stringify({{ action }}),
-    }});
+    }}).catch(() => {{}});
   }}
 
-  async function togglePlayPause() {{
-    await control("toggle");
+  // Instant play/pause: flip the icon immediately, then tell the server.
+  // We send explicit start/pause (not "toggle") based on the local state so rapid
+  // clicks never desync, and we ignore status polls briefly so the button can't
+  // flicker back from a stale response.
+  function togglePlayPause() {{
+    uiPlaying = !uiPlaying;
+    renderPlay(uiPlaying);
+    controlPendingUntil = Date.now() + 900;
+    control(uiPlaying ? "start" : "pause");
   }}
 
-  async function seekBy(delta, unit) {{
-    await fetch("/api/seek", {{
+  function seekBy(delta, unit) {{
+    fetch("/api/seek", {{
       method: "POST",
       headers: {{ "Content-Type": "application/json" }},
       body: JSON.stringify({{ mode: "relative", delta, unit }}),
-    }});
+    }}).catch(() => {{}});
   }}
 
   async function seekToSlider() {{
@@ -864,16 +1309,75 @@ def index():
     }});
   }}
 
+  const ICON_PLAY = '<svg viewBox="0 0 24 24" width="22" height="22"><path d="M8 5.5v13a1 1 0 0 0 1.54.84l10-6.5a1 1 0 0 0 0-1.68l-10-6.5A1 1 0 0 0 8 5.5z" fill="currentColor"/></svg>';
+  const ICON_PAUSE = '<svg viewBox="0 0 24 24" width="22" height="22"><rect x="6.5" y="5" width="4" height="14" rx="1.2" fill="currentColor"/><rect x="13.5" y="5" width="4" height="14" rx="1.2" fill="currentColor"/></svg>';
+
+  const playBtn = document.getElementById("play_pause_btn");
+  function renderPlay(playing) {{
+    playBtn.innerHTML = playing ? ICON_PAUSE : ICON_PLAY;
+    playBtn.classList.toggle("playing", !!playing);
+  }}
+
+  function formatTime(totalSeconds) {{
+    if (!isFinite(totalSeconds) || totalSeconds < 0) totalSeconds = 0;
+    const s = Math.floor(totalSeconds % 60);
+    const m = Math.floor(totalSeconds / 60);
+    return `${{m}}:${{String(s).padStart(2, "0")}}`;
+  }}
+
   async function refreshStatus() {{
     const res = await fetch("/api/status");
     const s = await res.json();
     const slider = document.getElementById("seek_slider");
-    slider.max = String(Math.max((s.total_frames || 1) - 1, 0));
+    const lastFrame = Math.max((s.total_frames || 1) - 1, 0);
+    slider.max = String(lastFrame);
     if (!suppressSliderUpdate) {{
       slider.value = String(Math.max(s.frame_idx || 0, 0));
     }}
-    const playPauseBtn = document.getElementById("play_pause_btn");
-    playPauseBtn.innerHTML = s.playing ? "&#10074;&#10074;" : "&#9658;";
+    // Only let the server's play state drive the button once our optimistic
+    // window has elapsed — keeps the click feeling instant and flicker-free.
+    if (Date.now() > controlPendingUntil) {{
+      uiPlaying = !!s.playing;
+      renderPlay(uiPlaying);
+    }}
+
+    const fps = s.fps || 25;
+    document.getElementById("time_cur").textContent = formatTime((Math.max(s.frame_idx, 0)) / fps);
+    document.getElementById("time_total").textContent = formatTime(lastFrame / fps);
+
+    // Seek-bar fills (YouTube-style): grey segments = every annotated region,
+    // accent = played so far, dark track = not yet loaded.
+    const cur = Math.max(s.frame_idx || 0, 0);
+    const span = Math.max(lastFrame, 1);
+    const step = Math.max(s.frame_step || 1, 1);
+    document.getElementById("seek_played").style.width = Math.min(100, (cur / span) * 100) + "%";
+
+    const ranges = s.loaded_ranges || [];
+    const segHtml = ranges.map(([a, b]) => {{
+      const left = Math.min(100, (a / span) * 100);
+      const width = Math.max(0.4, Math.min(100, ((b - a + step) / span) * 100));
+      return `<div class="seek-seg" style="left:${{left}}%;width:${{width}}%"></div>`;
+    }}).join("");
+    document.getElementById("seek_buffers").innerHTML = segHtml;
+
+    // How far ahead of the playhead is contiguously loaded (for the readout).
+    let aheadFrames = 0;
+    for (const [a, b] of ranges) {{
+      if (a <= cur + step && cur <= b) {{ aheadFrames = Math.max(0, b - cur); break; }}
+    }}
+    const pill = document.getElementById("buffer_pill");
+    const totalLoaded = s.loaded_count || 0;
+    if (aheadFrames >= 2 * step) {{
+      pill.textContent = `● Loaded · ${{(aheadFrames / fps).toFixed(1)}}s ahead`;
+      pill.classList.add("ready");
+    }} else if (totalLoaded > 0) {{
+      pill.textContent = `○ Loading… (${{totalLoaded}} cached)`;
+      pill.classList.remove("ready");
+    }} else {{
+      pill.textContent = "○ Loading…";
+      pill.classList.remove("ready");
+    }}
+
     const note = document.getElementById("video_action_note");
     if (personPickMode) {{
       note.style.display = "block";
@@ -887,8 +1391,14 @@ def index():
       note.style.display = "none";
       note.textContent = "";
     }}
-    document.getElementById("meta").textContent =
-      `Status: ${{s.playing ? "Playing" : "Paused"}} | Frame: ${{s.frame_idx}}/${{Math.max(s.total_frames-1, 0)}} | Displayed: ${{s.displayed_count}} | Error: ${{s.last_error || "none"}} | Last Action: ${{s.last_action || "none"}}`;
+
+    const parts = [
+      s.playing ? "&#9658; Playing" : "&#10074;&#10074; Paused",
+      `Frame ${{Math.max(s.frame_idx, 0)}} / ${{lastFrame}}`,
+      `${{s.available_person_count || 0}} persons`,
+    ];
+    if (s.last_error) parts.push(`<span style="color:#fca5a5">${{s.last_error}}</span>`);
+    document.getElementById("meta").innerHTML = parts.join(" &nbsp;·&nbsp; ");
   }}
 
   function togglePersonCrop() {{
@@ -947,11 +1457,11 @@ def index():
     const toast = document.getElementById("save_toast");
     toast.textContent = message;
     toast.classList.toggle("error", !!isError);
-    toast.style.display = "block";
+    toast.classList.add("show");
     if (toastTimer) clearTimeout(toastTimer);
     toastTimer = setTimeout(() => {{
-      toast.style.display = "none";
-    }}, 500);
+      toast.classList.remove("show");
+    }}, isError ? 2200 : 1100);
   }}
 
   async function requestCrop(payload) {{
@@ -990,17 +1500,55 @@ def index():
     await cropRequest("background");
   }}
 
-  const videoStream = document.getElementById("video_stream");
-  videoStream.addEventListener("click", async (evt) => {{
-    if (!personPickMode) return;
-    const rect = videoStream.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) return;
-    const xRatio = (evt.clientX - rect.left) / rect.width;
-    const yRatio = (evt.clientY - rect.top) / rect.height;
-    const ok = await cropPersonByPoint(xRatio, yRatio);
-    if (ok) closeActionModes();
-  }});
+  let exportPollTimer = null;
 
+  async function downloadInferenceVideo() {{
+    const btn = document.getElementById("download_video_btn");
+    const res = await fetch("/api/export", {{ method: "POST" }});
+    const data = await res.json().catch(() => ({{}}));
+    if (!res.ok || !data.ok) {{
+      showToast(data.error || "Could not start export.", true);
+      return;
+    }}
+    btn.disabled = true;
+    showToast("Rendering inference video...");
+    if (exportPollTimer) clearInterval(exportPollTimer);
+    exportPollTimer = setInterval(pollExportStatus, 700);
+  }}
+
+  async function pollExportStatus() {{
+    const btn = document.getElementById("download_video_btn");
+    let s;
+    try {{
+      const res = await fetch("/api/export/status");
+      s = await res.json();
+    }} catch (e) {{
+      return;
+    }}
+    if (s.error) {{
+      clearInterval(exportPollTimer);
+      exportPollTimer = null;
+      btn.disabled = false;
+      btn.textContent = "⬇ Download Video";
+      showToast(s.error, true);
+      return;
+    }}
+    if (s.running) {{
+      const pct = s.total ? Math.floor((s.progress / s.total) * 100) : 0;
+      btn.textContent = "Rendering " + pct + "%";
+      return;
+    }}
+    if (s.done) {{
+      clearInterval(exportPollTimer);
+      exportPollTimer = null;
+      btn.disabled = false;
+      btn.textContent = "⬇ Download Video";
+      showToast("Inference video ready. Downloading...");
+      window.location = "/download/video";
+    }}
+  }}
+
+  const videoStream = document.getElementById("video_stream");
   const drawOverlay = document.getElementById("draw_overlay");
   const drawBox = document.getElementById("draw_box");
 
@@ -1008,45 +1556,78 @@ def index():
     return Math.max(0, Math.min(1, v));
   }}
 
+  // The MJPEG frame is letterboxed inside the <img> via object-fit: contain.
+  // Return the on-screen rect of the actually-drawn image, not the element box.
+  function imageContentRect() {{
+    const rect = videoStream.getBoundingClientRect();
+    const nw = videoStream.naturalWidth, nh = videoStream.naturalHeight;
+    if (!nw || !nh || rect.width <= 0 || rect.height <= 0) return rect;
+    const scale = Math.min(rect.width / nw, rect.height / nh);
+    const dw = nw * scale, dh = nh * scale;
+    return {{
+      left: rect.left + (rect.width - dw) / 2,
+      top: rect.top + (rect.height - dh) / 2,
+      width: dw,
+      height: dh,
+    }};
+  }}
+
+  // Map a mouse event to image-space ratios (0..1), accounting for letterboxing.
+  function evtToImageRatio(evt) {{
+    const c = imageContentRect();
+    if (c.width <= 0 || c.height <= 0) return null;
+    return {{
+      x: clamp01((evt.clientX - c.left) / c.width),
+      y: clamp01((evt.clientY - c.top) / c.height),
+    }};
+  }}
+
+  videoStream.addEventListener("click", async (evt) => {{
+    if (!personPickMode) return;
+    const p = evtToImageRatio(evt);
+    if (!p) return;
+    const ok = await cropPersonByPoint(p.x, p.y);
+    if (ok) closeActionModes();
+  }});
+
+  // box ratios are in image space; convert to overlay-relative pixels for display.
   function updateDrawBoxDisplay(box) {{
     if (!drawStart || !box) return;
-    const x1 = Math.min(box.x1, box.x2) * 100;
-    const y1 = Math.min(box.y1, box.y2) * 100;
-    const x2 = Math.max(box.x1, box.x2) * 100;
-    const y2 = Math.max(box.y1, box.y2) * 100;
+    const overlayRect = drawOverlay.getBoundingClientRect();
+    const c = imageContentRect();
+    const offX = c.left - overlayRect.left;
+    const offY = c.top - overlayRect.top;
+    const x1 = offX + Math.min(box.x1, box.x2) * c.width;
+    const y1 = offY + Math.min(box.y1, box.y2) * c.height;
+    const x2 = offX + Math.max(box.x1, box.x2) * c.width;
+    const y2 = offY + Math.max(box.y1, box.y2) * c.height;
     drawBox.style.display = "block";
-    drawBox.style.left = `${{x1}}%`;
-    drawBox.style.top = `${{y1}}%`;
-    drawBox.style.width = `${{Math.max(0, x2 - x1)}}%`;
-    drawBox.style.height = `${{Math.max(0, y2 - y1)}}%`;
+    drawBox.style.left = `${{x1}}px`;
+    drawBox.style.top = `${{y1}}px`;
+    drawBox.style.width = `${{Math.max(0, x2 - x1)}}px`;
+    drawBox.style.height = `${{Math.max(0, y2 - y1)}}px`;
   }}
 
   drawOverlay.addEventListener("mousedown", (evt) => {{
     if (!manualDrawMode) return;
-    const rect = drawOverlay.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) return;
-    const x = clamp01((evt.clientX - rect.left) / rect.width);
-    const y = clamp01((evt.clientY - rect.top) / rect.height);
-    drawStart = {{ x, y }};
-    updateDrawBoxDisplay({{ x1: x, y1: y, x2: x, y2: y }});
+    const p = evtToImageRatio(evt);
+    if (!p) return;
+    drawStart = {{ x: p.x, y: p.y }};
+    updateDrawBoxDisplay({{ x1: p.x, y1: p.y, x2: p.x, y2: p.y }});
   }});
 
   drawOverlay.addEventListener("mousemove", (evt) => {{
     if (!manualDrawMode || !drawStart) return;
-    const rect = drawOverlay.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) return;
-    const x = clamp01((evt.clientX - rect.left) / rect.width);
-    const y = clamp01((evt.clientY - rect.top) / rect.height);
-    updateDrawBoxDisplay({{ x1: drawStart.x, y1: drawStart.y, x2: x, y2: y }});
+    const p = evtToImageRatio(evt);
+    if (!p) return;
+    updateDrawBoxDisplay({{ x1: drawStart.x, y1: drawStart.y, x2: p.x, y2: p.y }});
   }});
 
   drawOverlay.addEventListener("mouseup", async (evt) => {{
     if (!manualDrawMode || !drawStart) return;
-    const rect = drawOverlay.getBoundingClientRect();
-    if (rect.width <= 0 || rect.height <= 0) return;
-    const x = clamp01((evt.clientX - rect.left) / rect.width);
-    const y = clamp01((evt.clientY - rect.top) / rect.height);
-    const box = {{ x1: drawStart.x, y1: drawStart.y, x2: x, y2: y }};
+    const p = evtToImageRatio(evt);
+    if (!p) return;
+    const box = {{ x1: drawStart.x, y1: drawStart.y, x2: p.x, y2: p.y }};
     const ok = await requestCrop({{
       type: "manual_box",
       x1_ratio: box.x1,
@@ -1078,7 +1659,11 @@ def index():
       }}
       return;
     }}
-    if (key === "p") {{
+    if (evt.key === " " || evt.code === "Space") {{
+      if (tag === "button") return;
+      evt.preventDefault();
+      await togglePlayPause();
+    }} else if (key === "p") {{
       evt.preventDefault();
       if (manualDrawMode) {{
         closeActionModes();
@@ -1119,7 +1704,7 @@ def index():
   const ids = [
     "person_model_path", "ppe_model_path", "sm_model_path",
     "video_folder", "selected_video", "person_conf", "ppe_conf", "sm_conf",
-    "frame_step", "simulate_realtime"
+    "frame_step", "simulate_realtime", "ppe_inside_person"
   ];
   ids.forEach((id) => {{
     const el = document.getElementById(id);
@@ -1142,7 +1727,8 @@ def index():
     suppressSliderUpdate = false;
   }});
 
-  setInterval(refreshStatus, 500);
+  renderPlay(false);
+  setInterval(refreshStatus, 300);
   refreshStatus();
 </script>
 <div id="save_toast" class="toast"></div>
@@ -1157,6 +1743,7 @@ def api_config():
     payload = request.get_json(silent=True) or {}
     with state_lock:
         old_video = state["selected_video"]
+        old_cfg_key = compute_cfg_key()
         for key in (
             "person_model_path",
             "ppe_model_path",
@@ -1168,6 +1755,7 @@ def api_config():
             "sm_conf",
             "frame_step",
             "simulate_realtime",
+            "ppe_inside_person",
         ):
             if key in payload:
                 state[key] = payload[key]
@@ -1201,73 +1789,107 @@ def api_config():
         videos = list_videos(str(state["video_folder"]))
         if state["selected_video"] not in videos:
             state["selected_video"] = videos[0] if videos else ""
-        if old_video != state["selected_video"]:
-            release_capture()
+        video_changed = old_video != state["selected_video"]
+        if video_changed:
+            state["playing"] = False  # switching videos pauses playback
+        cfg_changed = compute_cfg_key() != old_cfg_key
+        cur_idx = runtime["frame_idx"]
         save_settings()
-        return jsonify({"ok": True, "videos": videos, "selected_video": state["selected_video"]})
+        selected_video = state["selected_video"]
+
+    # Switching videos: drop the annotation cache so the worker reloads the new one.
+    if video_changed:
+        release_capture()
+    elif cfg_changed and cur_idx >= 0:
+        # Model/conf/step changed: re-annotate + refresh the current frame now.
+        seek_to_frame(cur_idx)
+    return jsonify({"ok": True, "videos": videos, "selected_video": selected_video})
 
 
 @app.post("/api/control")
 def api_control():
     payload = request.get_json(silent=True) or {}
     action = payload.get("action", "").lower()
-    with state_lock:
-        if action == "start":
-            state["playing"] = True
-            ensure_capture_open()
-        elif action == "pause":
-            state["playing"] = False
-        elif action == "toggle":
-            if not state["playing"]:
-                state["playing"] = True
-                ensure_capture_open()
+
+    if action in ("start", "pause", "toggle"):
+        with state_lock:
+            if action == "start":
+                want = True
+            elif action == "pause":
+                want = False
             else:
-                state["playing"] = False
-        elif action == "stop":
-            release_capture()
+                want = not state["playing"]
+            state["playing"] = want
+        if want:
+            opened = ensure_capture_open()
+            if not opened:
+                with state_lock:
+                    state["playing"] = False
+    elif action == "stop":
+        with state_lock:
+            state["playing"] = False
+        release_capture()  # clears cache; worker re-anchors to the start
+        with state_lock:
+            runtime["frame_idx"] = -1
             runtime["last_jpg"] = None
             runtime["displayed_count"] = 0
             runtime["last_error"] = ""
+
+    with state_lock:
         save_settings()
-        return jsonify({"ok": True})
+    return jsonify({"ok": True})
 
 
 @app.post("/api/seek")
 def api_seek():
     payload = request.get_json(silent=True) or {}
     mode = str(payload.get("mode", "relative")).lower()
+
     with state_lock:
-        if not ensure_capture_open():
-            return jsonify({"ok": False, "error": runtime["last_error"]}), 400
-
+        has_video = bool(state["selected_video"])
         current_idx = runtime["frame_idx"]
-        if current_idx < 0:
-            current_idx = 0
+        fps = float(runtime["fps"]) if runtime["fps"] > 0 else 25.0
+    if not has_video:
+        return jsonify({"ok": False, "error": "Choose a valid video."}), 400
+    if current_idx < 0:
+        current_idx = 0
 
-        if mode == "absolute":
-            target_idx = int(payload.get("frame", current_idx))
-        else:
-            delta = int(payload.get("delta", 0))
-            unit = str(payload.get("unit", "frame")).lower()
-            if unit == "sec":
-                fps = float(runtime["fps"]) if runtime["fps"] > 0 else 25.0
-                delta = int(round(delta * fps))
-            target_idx = current_idx + delta
+    if mode == "absolute":
+        target_idx = int(payload.get("frame", current_idx))
+    else:
+        delta = int(payload.get("delta", 0))
+        unit = str(payload.get("unit", "frame")).lower()
+        if unit == "sec":
+            delta = int(round(delta * fps))
+        target_idx = current_idx + delta
 
-        ok = seek_to_frame(target_idx)
-        if not ok:
-            return jsonify({"ok": False, "error": runtime["last_error"]}), 400
-        return jsonify({"ok": True, "frame_idx": runtime["frame_idx"]})
+    ok = seek_to_frame(target_idx)
+    with state_lock:
+        err = runtime["last_error"]
+        frame_idx = runtime["frame_idx"]
+    if not ok:
+        return jsonify({"ok": False, "error": err}), 400
+    return jsonify({"ok": True, "frame_idx": frame_idx})
 
 
 @app.post("/api/crop")
 def api_crop():
     payload = request.get_json(silent=True) or {}
     crop_type = str(payload.get("type", "")).lower()
-    with state_lock:
-        if runtime["last_raw_frame"] is None:
-            return jsonify({"ok": False, "error": "No frame loaded yet."}), 400
+    reseek_idx = None  # manual_box re-renders the current frame AFTER releasing state_lock
 
+    # Fetch the raw (unannotated) pixels for the displayed frame on demand.
+    with state_lock:
+        video = state["selected_video"]
+        frame_idx = runtime["frame_idx"]
+    if frame_idx < 0 or not video:
+        return jsonify({"ok": False, "error": "No frame loaded yet."}), 400
+    raw = read_raw_frame(video, frame_idx)
+    if raw is None:
+        return jsonify({"ok": False, "error": "Could not read the current frame."}), 400
+
+    with state_lock:
+        runtime["last_raw_frame"] = raw  # crop helpers read this
         try:
             if crop_type == "person":
                 person_index = int(payload.get("person_index", 1))
@@ -1281,12 +1903,13 @@ def api_crop():
                 y1_ratio = float(payload.get("y1_ratio", 0.0))
                 x2_ratio = float(payload.get("x2_ratio", 0.0))
                 y2_ratio = float(payload.get("y2_ratio", 0.0))
-                next_person_index = len(runtime["last_person_boxes"]) + 1
+                class_name = str(payload.get("class_name") or "manual")
+                folder = sanitize_class_name(class_name)
                 box, frame_idx = add_manual_box_for_current_frame(
-                    x1_ratio, y1_ratio, x2_ratio, y2_ratio
+                    x1_ratio, y1_ratio, x2_ratio, y2_ratio, class_name=class_name
                 )
-                save_path = save_person_crop_from_box(box, suffix=f"person_{next_person_index}")
-                seek_to_frame(frame_idx)
+                save_path = save_person_crop_from_box(box, suffix=folder, subdir=folder)
+                reseek_idx = frame_idx
             elif crop_type == "frame":
                 save_path = save_frame_image(runtime["last_raw_frame"], "SM")
             elif crop_type == "background":
@@ -1298,23 +1921,204 @@ def api_crop():
             return jsonify({"ok": False, "error": str(exc)}), 400
 
         runtime["last_action"] = f"Saved {crop_type} crop: {save_path}"
-        return jsonify({"ok": True, "path": save_path})
+
+    # Re-render the current frame so the new manual box shows immediately.
+    # Done outside state_lock because seek_to_frame acquires its own locks.
+    if reseek_idx is not None:
+        seek_to_frame(reseek_idx)
+    return jsonify({"ok": True, "path": save_path})
+
+
+def _run_export(video_path: str, cfg_base: dict, manual_by_frame: dict):
+    """Background worker: re-run inference over the whole video and write an mp4."""
+    cap = cv2.VideoCapture(video_path)
+    writer = None
+    out_path = ""
+    try:
+        if not cap.isOpened():
+            raise RuntimeError("Failed to open the selected video for export.")
+
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        fps = fps if fps and fps > 1e-6 else 25.0
+        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT)) or 0
+        with export_lock:
+            export_state["total"] = total
+
+        out_dir = Path(__file__).resolve().parent / "exports"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        stem = Path(video_path).stem
+        out_path = str(out_dir / f"{stem}_inference.mp4")
+        download_name = f"{stem}_inference.mp4"
+
+        frame_idx = -1
+        while True:
+            ok, frame = cap.read()
+            if not ok:
+                break
+            frame_idx += 1
+
+            cfg = dict(cfg_base)
+            cfg["manual_boxes"] = list(manual_by_frame.get(frame_idx, []))
+            annotated, _boxes, error = annotate_frame(frame, cfg)
+            if error:
+                raise RuntimeError(error)
+            if annotated is None:
+                annotated = frame
+
+            if writer is None:
+                h, w = annotated.shape[:2]
+                fourcc = cv2.VideoWriter_fourcc(*"mp4v")
+                writer = cv2.VideoWriter(out_path, fourcc, fps, (w, h))
+                if not writer.isOpened():
+                    raise RuntimeError("Could not create the output video writer.")
+            writer.write(annotated)
+
+            with export_lock:
+                export_state["progress"] = frame_idx + 1
+
+        if writer is None:
+            raise RuntimeError("No frames were read from the video.")
+
+        with export_lock:
+            export_state["running"] = False
+            export_state["done"] = True
+            export_state["error"] = ""
+            export_state["output_path"] = out_path
+            export_state["download_name"] = download_name
+    except Exception as exc:
+        with export_lock:
+            export_state["running"] = False
+            export_state["done"] = False
+            export_state["error"] = str(exc)
+            export_state["output_path"] = ""
+            export_state["download_name"] = ""
+    finally:
+        if writer is not None:
+            writer.release()
+        cap.release()
+
+
+@app.post("/api/export")
+def api_export():
+    with state_lock:
+        video_path = state["selected_video"]
+        cfg_base = snapshot_inference_cfg(-1)
+        cfg_base.pop("manual_boxes", None)
+        manual_by_frame = {
+            idx: list(boxes)
+            for idx, boxes in runtime["manual_boxes_by_frame"].items()
+        }
+
+    if not video_path or not Path(video_path).is_file():
+        return jsonify({"ok": False, "error": "Choose a valid video first."}), 400
+
+    with export_lock:
+        if export_state["running"]:
+            return jsonify({"ok": False, "error": "An export is already running."}), 409
+        export_state.update(
+            {
+                "running": True,
+                "done": False,
+                "error": "",
+                "progress": 0,
+                "total": 0,
+                "output_path": "",
+                "download_name": "",
+            }
+        )
+
+    threading.Thread(
+        target=_run_export,
+        args=(video_path, cfg_base, manual_by_frame),
+        daemon=True,
+    ).start()
+    return jsonify({"ok": True})
+
+
+@app.get("/api/export/status")
+def api_export_status():
+    with export_lock:
+        return jsonify(dict(export_state))
+
+
+@app.get("/download/video")
+def download_video():
+    with export_lock:
+        out_path = export_state["output_path"]
+        download_name = export_state["download_name"] or "inference.mp4"
+    if not out_path or not Path(out_path).is_file():
+        return jsonify({"ok": False, "error": "No exported video available."}), 404
+    return send_file(
+        out_path,
+        mimetype="video/mp4",
+        as_attachment=True,
+        download_name=download_name,
+    )
+
+
+@app.get("/api/options")
+def api_options():
+    """JSON model/video options + current state, for the React control panel."""
+    with state_lock:
+        person_models = [
+            {"name": Path(p).name, "path": p}
+            for p in discover_pt_models([str(MODELS_DIR)])
+        ]
+        packages = [
+            {"name": folder, "path": pt}
+            for folder, pt in discover_model_packages(MODELS_DIR)
+        ]
+        videos = [
+            {"name": Path(v).name, "path": v}
+            for v in list_videos(str(state["video_folder"]))
+        ]
+        return jsonify(
+            {
+                "none_value": NONE_MODEL_VALUE,
+                "person_models": person_models,
+                "packages": packages,
+                "videos": videos,
+                "models_dir": str(MODELS_DIR),
+                "state": {
+                    "person_model_path": state["person_model_path"],
+                    "ppe_model_path": state["ppe_model_path"],
+                    "sm_model_path": state["sm_model_path"],
+                    "video_folder": state["video_folder"],
+                    "selected_video": state["selected_video"],
+                    "person_conf": state["person_conf"],
+                    "ppe_conf": state["ppe_conf"],
+                    "sm_conf": state["sm_conf"],
+                    "frame_step": state["frame_step"],
+                    "simulate_realtime": state["simulate_realtime"],
+                    "ppe_inside_person": state["ppe_inside_person"],
+                    "playing": state["playing"],
+                },
+            }
+        )
 
 
 @app.get("/api/status")
 def api_status():
     with state_lock:
-        return jsonify(
-            {
-                "playing": state["playing"],
-                "frame_idx": runtime["frame_idx"],
-                "total_frames": runtime["total_frames"],
-                "displayed_count": runtime["displayed_count"],
-                "last_error": runtime["last_error"],
-                "last_action": runtime["last_action"],
-                "available_person_count": len(runtime["last_person_boxes"]),
-            }
-        )
+        step = max(int(state["frame_step"]), 1)
+        payload = {
+            "playing": state["playing"],
+            "frame_idx": runtime["frame_idx"],
+            "total_frames": runtime["total_frames"],
+            "fps": float(runtime["fps"]) if runtime["fps"] > 0 else 25.0,
+            "displayed_count": runtime["displayed_count"],
+            "last_error": runtime["last_error"],
+            "last_action": runtime["last_action"],
+            "available_person_count": len(runtime["last_person_boxes"]),
+            "frame_step": step,
+        }
+    # Cache coverage as contiguous [start, end] ranges (separate lock, not nested).
+    with cache_lock:
+        ranges = cached_ranges(step)
+        loaded_count = len(frame_cache)
+    payload["loaded_ranges"] = ranges
+    payload["loaded_count"] = loaded_count
+    return jsonify(payload)
 
 
 @app.get("/stream.mjpg")
@@ -1336,5 +2140,7 @@ def _open_browser_when_ready(url: str, delay_sec: float = 0.8) -> None:
 if __name__ == "__main__":
     load_settings()
     configure_quiet_logging()
+    # Background producer that decodes + annotates frames ahead of playback.
+    threading.Thread(target=prerender_worker, daemon=True).start()
     _open_browser_when_ready("http://127.0.0.1:8500")
     app.run(host="0.0.0.0", port=8500, debug=False, threaded=True)

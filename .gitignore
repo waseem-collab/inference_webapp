@@ -1,7 +1,35 @@
-# All packaged models under the app models directory
-models/
+# Python caches
+__pycache__/
+*.pyc
+*.pyo
 
-# Optional: uncomment if you also keep weights outside `models/`
-# *.pt
-# *.pth
-# *.onnx
+# Model weights (too large for git — keep locally / use LFS or a release)
+models/
+*.pt
+*.pth
+*.onnx
+*.engine
+
+# Video inputs
+*.mp4
+*.avi
+*.mov
+*.mkv
+*.webm
+*.m4v
+
+# Generated outputs
+disagreement_frames/
+person_crops/
+crop_reports/
+crops/
+PPE/person crops/
+PPE/crops/
+
+# Per-user runtime state / remembered inputs
+disagreement_settings.json
+crop_balancer_settings.json
+review_settings.json
+saved_video_paths.json
+ppe_crop_centroids.jsonl
+ppe_cropper_paths.json

@@ -1,13 +1,14 @@
 {
-  "person_model_path": "/home/waseem/Desktop/inference_web_app/models/yolo26n.pt",
-  "ppe_model_path": "/home/waseem/Desktop/inference_web_app/models/ppe-detection-pt-1.2.6/ppe-detection-pt/ppe-detection.pt",
-  "sm_model_path": "__none__",
-  "video_folder": "/home/waseem/Downloads/esbaar",
-  "selected_video": "/home/waseem/Downloads/esbaar/D02_Test_Fire_And_Smoke.mp4",
+  "person_model_path": "__none__",
+  "ppe_model_path": "__none__",
+  "sm_model_path": "/home/waseemshaik/Desktop/all/inference_web_app/models/may28_single_model/may28_single_model.pt",
+  "video_folder": "/home/waseemshaik/Documents/recordings/ivl-egypt 2",
+  "selected_video": "/home/waseemshaik/Documents/recordings/ivl-egypt 2/Containers-Loading-Area_20260618_134824.mp4",
   "person_conf": 0.4,
   "ppe_conf": 0.4,
-  "sm_conf": 0.7,
+  "sm_conf": 0.4,
   "frame_step": 1,
   "simulate_realtime": true,
+  "ppe_inside_person": false,
   "playing": false
 }
