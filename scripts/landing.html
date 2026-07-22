@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Inference Suite</title>
+<style>
+  :root{
+    --bg:#0a0d1a; --panel:rgba(255,255,255,.075); --panel-2:rgba(255,255,255,.05); --panel-3:rgba(255,255,255,.1);
+    --line:rgba(255,255,255,.14); --line-2:rgba(255,255,255,.24);
+    --text:#f4f7ff; --muted:rgba(233,240,255,.72); --muted-2:rgba(233,240,255,.46);
+    --hivis:#ffb200; --hivis-soft:rgba(255,178,0,.14); --go:#a6e22e;
+    --mono:ui-monospace,"SF Mono","JetBrains Mono","Cascadia Code",Menlo,Consolas,monospace;
+    --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+  }
+  *{box-sizing:border-box;}
+  body{
+    margin:0;min-height:100vh;font-family:var(--sans);color:var(--text);
+    background:
+      radial-gradient(70% 70% at 18% 8%, rgba(96,124,214,.20), transparent 66%),
+      radial-gradient(62% 62% at 88% 92%, rgba(74,150,205,.15), transparent 66%),
+      linear-gradient(160deg,#0a0d1a,#0c1122 60%,#0a0d1a);
+    background-attachment:fixed;
+    display:flex;flex-direction:column;
+  }
+  .wrap{max-width:1060px;margin:0 auto;padding:64px 24px;width:100%;}
+  .brand{display:flex;align-items:center;gap:10px;margin-bottom:26px;}
+  .brand-dot{width:10px;height:10px;border-radius:50%;background:var(--go);
+    box-shadow:0 0 14px 1px rgba(166,226,46,.6);animation:pulse 1.9s ease-in-out infinite;}
+  @keyframes pulse{50%{box-shadow:0 0 5px 0 rgba(166,226,46,.3);}}
+  .brand-name{font-weight:800;letter-spacing:2.6px;font-size:14px;}
+  .brand-sub{font-family:var(--mono);font-size:10px;letter-spacing:2px;color:var(--muted);
+    border:1px solid var(--line-2);border-radius:5px;padding:2px 7px;}
+  h1{font-size:30px;margin:0 0 10px;font-weight:800;letter-spacing:.2px;display:flex;align-items:center;gap:12px;}
+  h1::before{content:"";width:5px;height:26px;border-radius:2px;background:var(--hivis);}
+  .sub{color:var(--muted);margin:0;font-size:15px;}
+  .cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(300px,1fr));gap:20px;margin-top:38px;}
+  .card{display:flex;flex-direction:column;text-decoration:none;color:inherit;
+    background:linear-gradient(180deg,rgba(255,255,255,.10),rgba(255,255,255,.012) 46%),var(--panel);
+    -webkit-backdrop-filter:blur(18px) saturate(160%);backdrop-filter:blur(18px) saturate(160%);
+    border:1px solid var(--line-2);border-radius:20px;padding:26px;
+    box-shadow:0 10px 30px rgba(0,0,0,.3),inset 0 1px 0 rgba(255,255,255,.2);
+    transition:border-color .16s,transform .16s,box-shadow .16s;position:relative;overflow:hidden;}
+  .card::after{content:"";position:absolute;inset:0 0 auto 0;height:2px;
+    background:linear-gradient(90deg,transparent,var(--hivis),transparent);opacity:0;transition:opacity .16s;}
+  .card:hover{border-color:var(--hivis);transform:translateY(-4px);box-shadow:0 24px 54px rgba(0,0,0,.5);}
+  .card:hover::after{opacity:.8;}
+  .tag{font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:1.8px;
+    color:var(--hivis);background:var(--hivis-soft);border:1px solid rgba(255,178,0,.3);
+    border-radius:999px;padding:3px 11px;align-self:flex-start;margin-bottom:18px;}
+  .card-icon{width:52px;height:52px;border-radius:14px;display:grid;place-items:center;font-size:26px;
+    background:var(--hivis-soft);color:var(--hivis);margin-bottom:18px;}
+  .card h2{font-size:19px;margin:0 0 9px;}
+  .card p{color:var(--muted);font-size:13.5px;line-height:1.6;margin:0 0 20px;flex:1;}
+  .open{display:inline-flex;align-items:center;gap:7px;color:var(--hivis);font-weight:700;font-size:14px;}
+  footer{margin-top:auto;text-align:center;color:var(--muted-2);font-size:12px;font-family:var(--mono);padding:26px;}
+  footer code{color:var(--muted);}
+</style>
+</head>
+<body>
+  <div class="wrap">
+    <div class="brand">
+      <span class="brand-dot"></span>
+      <span class="brand-name">INFERENCE SUITE</span>
+      <span class="brand-sub">PPE · SM · CROPS</span>
+    </div>
+    <h1>Pick a tool</h1>
+    <p class="sub">One server, two workspaces — run live detection, or build and clean training crops.</p>
+
+    <div class="cards">
+      <a class="card" href="/webapp/">
+        <span class="tag">Live</span>
+        <div class="card-icon">🎥</div>
+        <h2>Inference Web App</h2>
+        <p>Play a local video or stream a URL through your PPE + SM models. Step frame by frame, watch per-person PPE status, and export crops or an annotated video.</p>
+        <span class="open">Open workspace →</span>
+      </a>
+
+      <a class="card" href="/crop/">
+        <span class="tag">Dataset</span>
+        <div class="card-icon">🧮</div>
+        <h2>Crop Tools</h2>
+        <p>Balance person crops across a video, mine teacher / student disagreement frames, and review and clean up your datasets one pair at a time.</p>
+        <span class="open">Open workspace →</span>
+      </a>
+    </div>
+  </div>
+  <footer>Single server · started with <code>npm run dev</code> · auto-reloads on edits</footer>
+</body>
+</html>

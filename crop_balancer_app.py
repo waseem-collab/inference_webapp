@@ -57,6 +57,8 @@ DEFAULT_SETTINGS = {
     "cols": 4,
     "conf": 0.4,
     "stride": 15,
+    # Min seconds between two crops taken from the same grid cell (0 = no limit).
+    "min_gap_sec": 5,
 }
 
 DEFAULT_DISAGREE_SETTINGS = {
@@ -381,6 +383,27 @@ def pick_even(items_sorted, k):
     return [items_sorted[int(i * n / k)] for i in range(k)]
 
 
+def thin_by_min_gap(items, min_gap_frames):
+    """
+    Keep a temporally spread subset of candidate dicts whose 'frame_idx' values
+    are each at least min_gap_frames apart (greedy earliest-fit). This is applied
+    per grid cell BEFORE balancing, so no two crops chosen from one cell — even
+    when back-filling a sparse cell — come from within min_gap_frames of each other.
+    Any later even-subsampling of this list only widens the gaps, so the minimum
+    separation always holds.
+    """
+    if min_gap_frames <= 0 or len(items) <= 1:
+        return items
+    kept = []
+    last = None
+    for d in sorted(items, key=lambda d: d["frame_idx"]):
+        f = d["frame_idx"]
+        if last is None or f - last >= min_gap_frames:
+            kept.append(d)
+            last = f
+    return kept
+
+
 def allocate_balanced(cand_by_cell, total, rows, cols):
     """
     cand_by_cell: dict (row,col) -> list of candidate dicts.
@@ -435,12 +458,16 @@ def clear_output_dir(out_dir: Path):
                 pass
 
 
-def process_one_video(video_path, model, total, rows, cols, conf, stride, reports_dir):
+def process_one_video(video_path, model, total, rows, cols, conf, stride, reports_dir,
+                      min_gap_sec=0):
     """
     Run the full scan -> balance -> extract -> heatmap pipeline for ONE video.
     Crops go to person_crops/<stem>/ ; heatmap + manifest go to reports_dir,
     named with the video stem. Returns a per-video result dict (or raises).
     Progress is reported live via _set().
+
+    min_gap_sec: minimum spacing, in seconds of video time, between two crops
+    taken from the same grid cell (0 disables it).
     """
     video_path = str(Path(video_path).expanduser())
     video_stem = Path(video_path).stem
@@ -449,6 +476,10 @@ def process_one_video(video_path, model, total, rows, cols, conf, stride, report
     if not cap.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if not fps or fps <= 0 or fps != fps:  # 0 / negative / NaN guard
+        fps = 25.0
+    min_gap_frames = int(round(min_gap_sec * fps)) if min_gap_sec and min_gap_sec > 0 else 0
 
     ok, first_frame = cap.read()
     if not ok or first_frame is None:
@@ -493,6 +524,13 @@ def process_one_video(video_path, model, total, rows, cols, conf, stride, report
     _set(scanned_frames=idx, candidates=cand_total, phase="allocating",
          message=f"Balancing crops for {video_stem}...")
 
+    # Enforce temporal spacing per cell: drop candidates that sit within
+    # min_gap_frames of an already-kept one, so balancing (and any back-fill of a
+    # sparse cell) can never pick two crops from within min_gap_sec of each other.
+    if min_gap_frames > 0:
+        for cell in list(cand_by_cell.keys()):
+            cand_by_cell[cell] = thin_by_min_gap(cand_by_cell[cell], min_gap_frames)
+
     # --- Pass 2: balanced allocation ---
     take = allocate_balanced(cand_by_cell, total, rows, cols)
     selected_by_frame = {}
@@ -519,6 +557,7 @@ def process_one_video(video_path, model, total, rows, cols, conf, stride, report
         "requested_total": total,
         "frame_stride": stride,
         "person_conf": conf,
+        "min_gap_sec": min_gap_sec,
         "crops": [],
     }
     saved = 0
@@ -583,7 +622,7 @@ def process_one_video(video_path, model, total, rows, cols, conf, stride, report
     }
 
 
-def run_batch(input_path, model_path, total, rows, cols, conf, stride):
+def run_batch(input_path, model_path, total, rows, cols, conf, stride, min_gap_sec=0):
     try:
         input_path = str(Path(input_path).expanduser())
         if not model_path or not os.path.isfile(model_path):
@@ -612,7 +651,8 @@ def run_batch(input_path, model_path, total, rows, cols, conf, stride):
             stem = Path(vpath).stem
             _set(message=f"Video {i + 1}/{len(videos)}: {stem}")
             try:
-                vres = process_one_video(vpath, model, total, rows, cols, conf, stride, reports_dir)
+                vres = process_one_video(vpath, model, total, rows, cols, conf, stride,
+                                         reports_dir, min_gap_sec)
             except Exception as exc:  # noqa: BLE001 - skip a bad video, keep the batch going
                 vres = {"video": vpath, "video_stem": stem, "error": f"{type(exc).__name__}: {exc}",
                         "saved": 0, "requested": total}
@@ -970,47 +1010,205 @@ def _review_child(folder, kind, name, trash=False):
     return target
 
 
+CROP_CSS = """
+:root{
+  --bg:#0a0c11; --stage:#04060a; --panel:#12151d; --panel-2:#171b24; --panel-3:#1b202c;
+  --line:#232a37; --line-2:#313a4b; --text:#eef2f8; --muted:#8b93a5; --muted-2:#616a7d;
+  --hivis:#ffb200; --hivis-2:#ffcb45; --hivis-soft:rgba(255,178,0,.14);
+  --go:#a6e22e; --go-deep:#7fb800; --bad:#f2555a;
+  --mono:ui-monospace,"SF Mono","JetBrains Mono","Cascadia Code",Menlo,Consolas,monospace;
+  --sans:system-ui,-apple-system,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
+}
+*{box-sizing:border-box;}
+body{margin:0;font-family:var(--sans);color:var(--text);
+  background:radial-gradient(1200px 700px at 82% -12%,rgba(255,178,0,.05),transparent 60%),
+             radial-gradient(900px 620px at -12% 112%,rgba(120,160,255,.05),transparent 55%),var(--bg);}
+::-webkit-scrollbar{width:9px;height:9px;}
+::-webkit-scrollbar-thumb{background:#2a3242;border-radius:9px;border:2px solid transparent;background-clip:content-box;}
+::-webkit-scrollbar-thumb:hover{background:#3a4356;background-clip:content-box;}
+.mono{font-family:var(--mono);}
+.wrap{max-width:1480px;margin:0 auto;padding:20px 20px 64px;}
+.wrap.narrow{max-width:1160px;}
+
+.topbar{display:flex;align-items:center;gap:14px;margin:0 0 6px;}
+.brand{display:flex;align-items:center;gap:9px;}
+.brand-dot{width:9px;height:9px;border-radius:50%;background:var(--go);box-shadow:0 0 12px 1px rgba(166,226,46,.55);}
+.brand-name{font-weight:800;letter-spacing:2.5px;font-size:13px;}
+.back{font-size:12.5px;color:var(--muted);text-decoration:none;background:var(--panel-2);
+  border:1px solid var(--line-2);border-radius:8px;padding:7px 13px;transition:border-color .15s,color .15s;}
+.back:hover{color:var(--text);border-color:var(--hivis);}
+/* Home button: a distinct hi-vis pill so "return to the app picker" always reads
+   as the primary way out (matches the Inference Web App's home button). */
+.home-btn{margin-left:auto;display:inline-flex;align-items:center;gap:8px;font-size:12.5px;font-weight:700;
+  letter-spacing:.2px;text-decoration:none;color:var(--hivis);cursor:pointer;
+  background:var(--hivis-soft);border:1px solid rgba(255,178,0,.42);border-radius:10px;padding:8px 15px;
+  transition:color .15s,background .15s,border-color .15s,box-shadow .15s,transform .12s;}
+.home-btn svg{width:15px;height:15px;flex:0 0 auto;}
+.home-btn:hover{color:#0a0c11;background:var(--hivis);border-color:var(--hivis);
+  box-shadow:0 6px 18px rgba(255,178,0,.32);transform:translateY(-1px);}
+.home-btn:active{transform:translateY(0);}
+
+/* ---- Themed custom dropdowns (progressive enhancement over native <select>) ----
+   Injected script (see _inject_dropdowns) hides each <select> and drives this UI,
+   keeping the <select> as the value source of truth. Matches the Inference Web
+   App: hi-vis hover, one-open-at-a-time, search on long lists, scroll-safe. */
+.dd{position:relative;min-width:0;}
+.dd-btn{width:100%;min-height:38px;padding:9px 34px 9px 11px;text-align:left;font-family:var(--sans);font-size:13px;
+  color:var(--text);background:var(--panel-2);border:1px solid var(--line-2);border-radius:9px;cursor:pointer;
+  white-space:nowrap;overflow:hidden;text-overflow:ellipsis;transition:border-color .14s,box-shadow .14s;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5 6 6.5 11 1.5' fill='none' stroke='%23ffb200' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 12px center;}
+.dd-btn:hover{border-color:var(--hivis);}
+.dd.open .dd-btn{border-color:var(--hivis);box-shadow:0 0 0 3px var(--hivis-soft);
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 6.5 6 1.5 11 6.5' fill='none' stroke='%23ffb200' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");}
+.dd-menu{position:fixed;z-index:200;max-height:300px;background:var(--panel-3);border:1px solid var(--line-2);
+  border-radius:11px;padding:6px;box-shadow:0 18px 44px rgba(0,0,0,.6);display:none;flex-direction:column;}
+.dd-menu.open{display:flex;}
+.dd-search{width:100%;height:32px;margin-bottom:6px;padding:6px 9px;font-size:12.5px;color:var(--text);min-height:0;
+  background:var(--panel);border:1px solid var(--line-2);border-radius:7px;outline:none;}
+.dd-search:focus{border-color:var(--hivis);box-shadow:none;}
+.dd-scroll{overflow-y:auto;}
+.dd-opt{display:flex;align-items:center;gap:8px;padding:8px 10px;border-radius:7px;font-size:13px;color:var(--text);
+  cursor:pointer;white-space:nowrap;}
+.dd-opt::before{content:"";width:12px;flex:0 0 auto;color:var(--hivis);font-size:11px;text-align:center;}
+.dd-opt:hover{background:var(--hivis-soft);color:var(--hivis);}
+.dd-opt.sel{color:var(--hivis);}
+.dd-opt.sel::before{content:"✓";}
+h1{font-size:22px;margin:8px 0 18px;font-weight:700;letter-spacing:.2px;display:flex;align-items:center;gap:11px;}
+h1::before{content:"";width:4px;height:20px;border-radius:2px;background:var(--hivis);}
+
+.grid{display:grid;grid-template-columns:392px minmax(0,1fr);gap:16px;align-items:start;}
+.left,.right{min-width:0;}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:14px;padding:15px;margin-bottom:14px;}
+.panel-title{font-size:11px;text-transform:uppercase;letter-spacing:1.4px;color:#c7cedb;font-weight:700;
+  margin:0 0 13px;display:flex;align-items:center;gap:8px;}
+.panel-title::before{content:"";width:3px;height:13px;border-radius:2px;background:var(--hivis);}
+
+.item{display:flex;flex-direction:column;gap:6px;margin-bottom:11px;}
+label{font-size:11px;color:var(--muted);letter-spacing:.3px;}
+input,select,button{width:100%;min-height:38px;padding:9px 11px;background:var(--panel-2);color:var(--text);
+  border:1px solid var(--line-2);border-radius:9px;outline:none;font-size:13px;font-family:var(--sans);
+  transition:border-color .14s,box-shadow .14s,filter .12s,transform .05s;}
+input[type=number]{font-family:var(--mono);}
+input:focus,select:focus{border-color:var(--hivis);box-shadow:0 0 0 3px var(--hivis-soft);}
+select{cursor:pointer;-webkit-appearance:none;appearance:none;padding-right:34px;
+  background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='8' viewBox='0 0 12 8'%3E%3Cpath d='M1 1.5 6 6.5 11 1.5' fill='none' stroke='%23ffb200' stroke-width='1.8' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 12px center;}
+select option{background:var(--panel-2);color:var(--text);}
+input[type=checkbox]{width:17px;height:17px;min-height:0;accent-color:var(--hivis);cursor:pointer;}
+.row2{display:grid;grid-template-columns:1fr 1fr;gap:11px;}
+button{cursor:pointer;font-weight:600;}
+button:hover{filter:brightness(1.08);}
+button:active{transform:translateY(1px);}
+button:disabled{opacity:.45;cursor:not-allowed;filter:none;transform:none;}
+
+.btn-run,.btn-restore{background:linear-gradient(180deg,var(--go),var(--go-deep));color:#06210a;border:none;
+  min-height:44px;font-size:14px;font-weight:700;box-shadow:0 4px 14px rgba(126,184,0,.28);}
+.btn-prev,.btn-load,.btn-nav{background:var(--panel-2);border:1px solid var(--line-2);color:var(--text);}
+.btn-prev:hover,.btn-load:hover,.btn-nav:hover{border-color:var(--hivis);}
+.btn-skip{background:var(--hivis-soft);border:1px solid var(--hivis);color:var(--hivis);}
+.btn-stop,.btn-del{background:rgba(242,85,90,.14);border:1px solid var(--bad);color:#ffb4b6;}
+.btn-load,.btn-nav,.btn-del,.btn-restore,.tab{width:auto;}
+.btn-load{min-width:120px;} .btn-nav{min-width:112px;} .btn-del{min-width:132px;} .btn-restore{min-width:120px;}
+
+.meta{font-size:12.5px;color:var(--muted);line-height:1.5;}
+.err{color:#ffb4b6;}
+.hidden{display:none;}
+
+.progress{height:10px;background:#0c0f16;border:1px solid var(--line);border-radius:6px;overflow:hidden;margin:10px 0;}
+.progress>div{height:100%;width:0%;background:linear-gradient(90deg,var(--hivis),var(--hivis-2));transition:width .3s;}
+
+.preview-img,.heatmap-img,.heatmap-thumb{width:100%;border:1px solid var(--line);border-radius:11px;
+  background:var(--stage);display:block;}
+.heatmap-thumb{max-height:300px;object-fit:contain;}
+
+.gallery{display:grid;grid-template-columns:repeat(auto-fill,minmax(118px,1fr));gap:8px;margin-top:12px;
+  max-height:340px;overflow:auto;}
+.gallery img{width:100%;height:110px;object-fit:cover;border-radius:9px;border:1px solid var(--line);}
+.vid-block{border:1px solid var(--line);border-radius:11px;padding:13px;margin-top:12px;background:var(--panel-2);}
+.vid-block h3{font-size:14px;margin:0 0 8px;font-family:var(--mono);color:#e7ecf4;}
+
+.pill,.badge{display:inline-block;font-family:var(--mono);font-size:11px;color:var(--muted);background:var(--panel-3);
+  border:1px solid var(--line-2);border-radius:999px;padding:2px 9px;margin:2px 4px 2px 0;}
+.badge{margin:0 0 0 6px;color:#c7cedb;}
+
+.bar{display:flex;gap:12px;align-items:flex-end;}
+.bar .item{flex:1;margin-bottom:0;}
+.tabs{display:flex;gap:8px;margin-top:14px;}
+.tab{padding:9px 17px;background:var(--panel-2);border:1px solid var(--line-2);color:var(--muted);
+  border-radius:9px;font-size:13px;min-height:0;}
+.tab.active{background:var(--hivis-soft);border-color:var(--hivis);color:var(--hivis);}
+.filters{display:flex;gap:12px;align-items:flex-end;margin-top:14px;flex-wrap:wrap;}
+.filters .item{margin-bottom:0;}
+.filters .item.small{width:130px;}
+.viewer-head{display:flex;justify-content:space-between;align-items:center;gap:10px;margin-bottom:12px;}
+.viewer-head .name{font-size:13px;color:#c7cedb;word-break:break-all;font-family:var(--mono);}
+.viewer-head .count{font-size:13px;color:var(--muted);white-space:nowrap;font-family:var(--mono);}
+.stage{display:flex;align-items:center;justify-content:center;background:var(--stage);border:1px solid var(--line);
+  border-radius:12px;min-height:320px;}
+.stage img{max-width:100%;max-height:72vh;display:block;border-radius:10px;}
+.missing{color:var(--muted);padding:60px 0;font-size:14px;}
+.controls{display:flex;gap:10px;justify-content:center;align-items:center;margin-top:14px;}
+.controls span{display:inline-flex;gap:10px;}
+.hint{text-align:center;color:var(--muted);font-size:12px;margin-top:10px;}
+
+.hub{max-width:1020px;margin:0 auto;padding:58px 20px;}
+.hub-brand{display:flex;align-items:center;gap:10px;margin-bottom:22px;}
+.hub-title{font-size:27px;margin:0 0 8px;font-weight:800;letter-spacing:.2px;}
+.sub{color:var(--muted);margin:0;font-size:14px;}
+.cards{display:grid;grid-template-columns:repeat(auto-fit,minmax(288px,1fr));gap:18px;margin-top:32px;}
+.card{display:flex;flex-direction:column;text-decoration:none;color:inherit;background:var(--panel);
+  border:1px solid var(--line);border-radius:16px;padding:22px;
+  transition:border-color .16s,transform .16s,box-shadow .16s;}
+.card:hover{border-color:var(--hivis);transform:translateY(-3px);box-shadow:0 16px 42px rgba(0,0,0,.5);}
+.card-icon{width:44px;height:44px;border-radius:12px;display:grid;place-items:center;font-size:22px;
+  background:var(--hivis-soft);color:var(--hivis);margin-bottom:16px;}
+.card h2{font-size:17px;margin:0 0 8px;}
+.card p{color:var(--muted);font-size:13px;line-height:1.55;margin:0;}
+.card code{font-family:var(--mono);font-size:12px;color:#c7cedb;background:var(--panel-2);padding:1px 5px;border-radius:5px;}
+.tag{display:inline-block;font-family:var(--mono);font-size:10px;text-transform:uppercase;letter-spacing:1.6px;
+  color:var(--hivis);background:var(--hivis-soft);border:1px solid rgba(255,178,0,.3);border-radius:999px;
+  padding:2px 9px;margin-bottom:14px;align-self:flex-start;}
+@media (max-width:1080px){ .grid{grid-template-columns:1fr;} }
+@media (max-width:720px){ .cards{grid-template-columns:1fr;} .bar{flex-wrap:wrap;} }
+
+/* ==================== LIQUID GLASS THEME ==================== */
+:root{
+  --text:#f4f7ff;--muted:rgba(233,240,255,.74);--muted-2:rgba(233,240,255,.48);
+  --panel:rgba(255,255,255,.085);--panel-2:rgba(255,255,255,.07);--panel-3:rgba(255,255,255,.12);
+  --line:rgba(255,255,255,.14);--line-2:rgba(255,255,255,.24);--stage:rgba(6,9,22,.5);
+}
+body{
+  background:
+    radial-gradient(70% 70% at 18% 8%, rgba(96,124,214,.20), transparent 66%),
+    radial-gradient(62% 62% at 88% 92%, rgba(74,150,205,.15), transparent 66%),
+    linear-gradient(160deg,#0a0d1a,#0c1122 60%,#0a0d1a) !important;
+  background-attachment:fixed !important;
+}
+::-webkit-scrollbar-thumb{background:rgba(255,255,255,.24);}
+/* Only the big panels are blurred (perf). */
+.panel,.card{
+  background:linear-gradient(180deg,rgba(255,255,255,.10),rgba(255,255,255,.012) 46%),var(--panel) !important;
+  -webkit-backdrop-filter:blur(18px) saturate(160%);backdrop-filter:blur(18px) saturate(160%);
+  border:1px solid var(--line-2) !important;
+  box-shadow:0 10px 30px rgba(0,0,0,.32),inset 0 1px 0 rgba(255,255,255,.2);
+}
+.stage{background:var(--stage) !important;}
+.vid-block,.discovered{background:rgba(255,255,255,.05) !important;border:1px solid var(--line-2) !important;}
+.gallery img{border:1px solid var(--line-2);}
+"""
+
+
 PAGE = """<!doctype html>
 <html>
 <head>
   <meta charset="utf-8" />
   <title>__TITLE__</title>
-  <style>
-    :root { --bg:#0f1115; --panel:#161a22; --panel2:#1a1d24; --border:#2b3140; --border2:#3a4150;
-            --text:#eef1f6; --muted:#9aa4b4; --accent:#5f89ff; }
-    * { box-sizing: border-box; }
-    body { margin:0; font-family:'Segoe UI',system-ui,Arial,sans-serif; background:var(--bg); color:var(--text); }
-    .wrap { max-width: 1500px; margin:0 auto; padding:18px; }
-    h1 { font-size:20px; margin:0 0 14px; }
-    .grid { display:grid; grid-template-columns: 380px minmax(0,1fr); gap:16px; align-items:start; }
-    .panel { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:14px; margin-bottom:14px; }
-    .panel-title { font-size:12px; text-transform:uppercase; letter-spacing:.4px; color:#cdd5e1; font-weight:600; margin:0 0 10px; }
-    .item { display:flex; flex-direction:column; gap:5px; margin-bottom:10px; }
-    label { font-size:12px; color:var(--muted); }
-    input, select, button { width:100%; min-height:36px; padding:8px 10px; background:var(--panel2);
-            color:var(--text); border:1px solid var(--border2); border-radius:6px; outline:none; font-size:13px; }
-    input:focus, select:focus { border-color:var(--accent); }
-    .row2 { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
-    button { cursor:pointer; font-weight:600; transition:filter .12s; }
-    button:hover { filter:brightness(1.15); }
-    .btn-run { background:#1b5e20; border-color:#2e7d32; min-height:42px; font-size:15px; }
-    .btn-prev { background:#23314b; border-color:#33507f; }
-    .preview-img, .heatmap-img { width:100%; border:1px solid var(--border); border-radius:8px; background:#000; display:block; }
-    .meta { font-size:13px; color:#bbb; }
-    .progress { height:10px; background:#0c0e12; border:1px solid var(--border); border-radius:6px; overflow:hidden; margin:8px 0; }
-    .progress > div { height:100%; width:0%; background:linear-gradient(90deg,#3b62d6,#5f89ff); transition:width .3s; }
-    .gallery { display:grid; grid-template-columns: repeat(auto-fill,minmax(96px,1fr)); gap:6px; margin-top:10px; max-height:260px; overflow:auto; }
-    .gallery img { width:100%; height:96px; object-fit:cover; border-radius:6px; border:1px solid var(--border); }
-    .vid-block { border:1px solid var(--border); border-radius:8px; padding:10px; margin-top:10px; }
-    .vid-block h3 { font-size:14px; margin:0 0 6px; }
-    .heatmap-thumb { width:100%; max-height:300px; object-fit:contain; border-radius:6px; border:1px solid var(--border); background:#000; }
-    .pill { display:inline-block; background:#23314b; border:1px solid #33507f; border-radius:999px; padding:2px 10px; font-size:12px; margin:2px 4px 2px 0; }
-    .hidden { display:none; }
-    .err { color:#fda4af; }
-  </style>
+  <style>__CSS__</style>
 </head>
 <body>
   <div class="wrap">
+    <header class="topbar"><div class="brand"><span class="brand-dot"></span><span class="brand-name">CROP TOOLS</span></div><a class="home-btn" href="/home" title="Back to the app picker"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V20a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9.5"/><path d="M9.5 21v-6h5v6"/></svg>Home</a></header>
     <h1>__TITLE__</h1>
     <div class="grid">
       <div class="left">
@@ -1027,6 +1225,7 @@ PAGE = """<!doctype html>
             <div class="item"><label for="conf">Person conf</label><input id="conf" type="number" min="0" max="1" step="0.05" value="0.4" /></div>
             <div class="item"><label for="stride">Frame stride</label><input id="stride" type="number" min="1" max="120" value="15" /></div>
           </div>
+          <div class="item"><label for="min_gap_sec">Min seconds between crops per cell (0 = off)</label><input id="min_gap_sec" type="number" min="0" step="0.5" value="5" /></div>
           <div class="row2">
             <button class="btn-prev" onclick="loadPreview()">Preview grid</button>
             <button class="btn-run" id="run_btn" onclick="runJob()">Run</button>
@@ -1062,7 +1261,7 @@ PAGE = """<!doctype html>
   // Restore remembered inputs (model_path comes pre-selected server-side).
   function applySaved(){
     if (SAVED.video_path) document.getElementById("video_path").value = SAVED.video_path;
-    ["total","rows","cols","conf","stride"].forEach(k => {
+    ["total","rows","cols","conf","stride","min_gap_sec"].forEach(k => {
       if (SAVED[k] !== undefined && SAVED[k] !== null) document.getElementById(k).value = SAVED[k];
     });
   }
@@ -1096,6 +1295,7 @@ PAGE = """<!doctype html>
       cols: Number(val("cols")),
       conf: Number(val("conf")),
       stride: Number(val("stride")),
+      min_gap_sec: Number(val("min_gap_sec")),
     };
     const res = await fetch("/api/run", { method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(payload) });
     const data = await res.json();
@@ -1183,52 +1383,36 @@ PAGE = """<!doctype html>
 DISAGREE_TITLE = "Teacher / Student Disagreement Frames"
 
 LANDING_PAGE = """<!doctype html>
-<html>
+<html lang="en">
 <head>
   <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Crop Tools</title>
-  <style>
-    :root { --bg:#0f1115; --panel:#161a22; --border:#2b3140; --text:#eef1f6; --muted:#9aa4b4; --accent:#5f89ff; }
-    * { box-sizing: border-box; }
-    body { margin:0; font-family:'Segoe UI',system-ui,Arial,sans-serif; background:var(--bg); color:var(--text); }
-    .wrap { max-width: 980px; margin:0 auto; padding:40px 18px; }
-    h1 { font-size:24px; margin:0 0 6px; }
-    .sub { color:var(--muted); margin:0 0 28px; font-size:14px; }
-    .cards { display:grid; grid-template-columns:repeat(auto-fit,minmax(280px,1fr)); gap:20px; }
-    .card { display:block; text-decoration:none; color:inherit; background:var(--panel);
-            border:1px solid var(--border); border-radius:14px; padding:22px; transition:border-color .15s, transform .15s; }
-    .card:hover { border-color:var(--accent); transform:translateY(-2px); }
-    .card h2 { font-size:18px; margin:0 0 8px; }
-    .card p { color:var(--muted); font-size:13px; line-height:1.5; margin:0; }
-    .tag { display:inline-block; font-size:11px; text-transform:uppercase; letter-spacing:.5px;
-           color:#cdd5e1; background:#23314b; border:1px solid #33507f; border-radius:999px; padding:2px 10px; margin-bottom:12px; }
-    @media (max-width:720px){ .cards { grid-template-columns:1fr; } }
-  </style>
+  <style>__CSS__</style>
 </head>
 <body>
-  <div class="wrap">
-    <h1>Crop Tools</h1>
-    <p class="sub">Choose a tool.</p>
+  <div class="hub">
+    <div class="hub-brand"><span class="brand-dot"></span><span class="brand-name">CROP TOOLS</span><a class="home-btn" href="/home" title="Back to the app picker"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V20a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9.5"/><path d="M9.5 21v-6h5v6"/></svg>Home</a></div>
+    <h1 class="hub-title">Choose a tool</h1>
+    <p class="sub">Balance crops across a video, mine teacher / student disagreements, and clean up your datasets.</p>
     <div class="cards">
       <a class="card" href="/balancer">
-        <div class="tag">Existing</div>
+        <span class="tag">Balance</span>
+        <div class="card-icon">▦</div>
         <h2>Person Crop Balancer</h2>
-        <p>Detect persons across a video, balance crops across a grid so every region is fairly
-           represented, and export a chosen total with a heatmap.</p>
+        <p>Detect persons across a video and export a spatially balanced set of crops so every grid region is fairly represented, with a heatmap.</p>
       </a>
       <a class="card" href="/disagreement">
-        <div class="tag">New</div>
+        <span class="tag">Mine</span>
+        <div class="card-icon">◑</div>
         <h2>Teacher / Student Disagreement</h2>
-        <p>Pick a teacher and a student model. Keep every full frame where, in some grid block,
-           the teacher detects a person but the student misses it &mdash; ideal for mining the
-           student's failure cases.</p>
+        <p>Keep every full frame where, in some grid block, the teacher detects a person but the student misses it &mdash; ideal for mining the student's failure cases.</p>
       </a>
       <a class="card" href="/review">
-        <div class="tag">New</div>
+        <span class="tag">Clean</span>
+        <div class="card-icon">✓</div>
         <h2>Review &amp; Clean Up</h2>
-        <p>Point at a folder with <code>frames/</code> and <code>overlays/</code>. Flip through the
-           overlays one at a time and delete a pair &mdash; removing both the overlay and its frame
-           from their respective folders in one click.</p>
+        <p>Point at a folder with <code>frames/</code> and <code>overlays/</code>. Flip through overlays and delete a pair in one click, with a trash you can restore from.</p>
       </a>
     </div>
   </div>
@@ -1241,46 +1425,11 @@ DISAGREE_PAGE = """<!doctype html>
 <head>
   <meta charset="utf-8" />
   <title>__TITLE__</title>
-  <style>
-    :root { --bg:#0f1115; --panel:#161a22; --panel2:#1a1d24; --border:#2b3140; --border2:#3a4150;
-            --text:#eef1f6; --muted:#9aa4b4; --accent:#5f89ff; }
-    * { box-sizing: border-box; }
-    body { margin:0; font-family:'Segoe UI',system-ui,Arial,sans-serif; background:var(--bg); color:var(--text); }
-    .wrap { max-width: 1500px; margin:0 auto; padding:18px; }
-    h1 { font-size:20px; margin:0 0 14px; }
-    a.back { color:var(--muted); text-decoration:none; font-size:13px; }
-    a.back:hover { color:var(--accent); }
-    .grid { display:grid; grid-template-columns: 380px minmax(0,1fr); gap:16px; align-items:start; }
-    .panel { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:14px; margin-bottom:14px; }
-    .panel-title { font-size:12px; text-transform:uppercase; letter-spacing:.4px; color:#cdd5e1; font-weight:600; margin:0 0 10px; }
-    .item { display:flex; flex-direction:column; gap:5px; margin-bottom:10px; }
-    label { font-size:12px; color:var(--muted); }
-    input, select, button { width:100%; min-height:36px; padding:8px 10px; background:var(--panel2);
-            color:var(--text); border:1px solid var(--border2); border-radius:6px; outline:none; font-size:13px; }
-    input:focus, select:focus { border-color:var(--accent); }
-    .row2 { display:grid; grid-template-columns:1fr 1fr; gap:10px; }
-    button { cursor:pointer; font-weight:600; transition:filter .12s; }
-    button:hover { filter:brightness(1.15); }
-    .btn-run { background:#1b5e20; border-color:#2e7d32; min-height:42px; font-size:15px; }
-    .btn-prev { background:#23314b; border-color:#33507f; }
-    .btn-skip { background:#5a4a12; border-color:#8a6d1c; }
-    .btn-stop { background:#5e1b1b; border-color:#7d2e2e; }
-    button:disabled { opacity:.45; cursor:not-allowed; filter:none; }
-    .preview-img { width:100%; border:1px solid var(--border); border-radius:8px; background:#000; display:block; }
-    .meta { font-size:13px; color:#bbb; }
-    .progress { height:10px; background:#0c0e12; border:1px solid var(--border); border-radius:6px; overflow:hidden; margin:8px 0; }
-    .progress > div { height:100%; width:0%; background:linear-gradient(90deg,#3b62d6,#5f89ff); transition:width .3s; }
-    .gallery { display:grid; grid-template-columns: repeat(auto-fill,minmax(150px,1fr)); gap:6px; margin-top:10px; max-height:420px; overflow:auto; }
-    .gallery img { width:100%; height:120px; object-fit:cover; border-radius:6px; border:1px solid var(--border); }
-    .vid-block { border:1px solid var(--border); border-radius:8px; padding:10px; margin-top:10px; }
-    .vid-block h3 { font-size:14px; margin:0 0 6px; }
-    .hidden { display:none; }
-    .err { color:#fda4af; }
-  </style>
+  <style>__CSS__</style>
 </head>
 <body>
   <div class="wrap">
-    <a class="back" href="/">&larr; Back to tools</a>
+    <header class="topbar"><div class="brand"><span class="brand-dot"></span><span class="brand-name">CROP TOOLS</span></div><a class="home-btn" href="/home" title="Back to the app picker"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V20a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9.5"/><path d="M9.5 21v-6h5v6"/></svg>Home</a></header>
     <h1>__TITLE__</h1>
     <div class="grid">
       <div class="left">
@@ -1518,54 +1667,11 @@ REVIEW_PAGE = """<!doctype html>
 <head>
   <meta charset="utf-8" />
   <title>__TITLE__</title>
-  <style>
-    :root { --bg:#0f1115; --panel:#161a22; --panel2:#1a1d24; --border:#2b3140; --border2:#3a4150;
-            --text:#eef1f6; --muted:#9aa4b4; --accent:#5f89ff; }
-    * { box-sizing: border-box; }
-    body { margin:0; font-family:'Segoe UI',system-ui,Arial,sans-serif; background:var(--bg); color:var(--text); }
-    .wrap { max-width: 1100px; margin:0 auto; padding:18px; }
-    h1 { font-size:20px; margin:0 0 14px; }
-    a.back { color:var(--muted); text-decoration:none; font-size:13px; }
-    a.back:hover { color:var(--accent); }
-    .panel { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:14px; margin-bottom:14px; }
-    .bar { display:flex; gap:10px; align-items:flex-end; }
-    .bar .item { flex:1; display:flex; flex-direction:column; gap:5px; }
-    label { font-size:12px; color:var(--muted); }
-    input, select, button { min-height:38px; padding:8px 12px; background:var(--panel2); color:var(--text);
-            border:1px solid var(--border2); border-radius:6px; outline:none; font-size:13px; }
-    input, select { width:100%; }
-    input:focus, select:focus { border-color:var(--accent); }
-    button { cursor:pointer; font-weight:600; transition:filter .12s; }
-    button:hover { filter:brightness(1.15); }
-    button:disabled { opacity:.4; cursor:not-allowed; filter:none; }
-    .btn-load { background:#23314b; border-color:#33507f; min-width:120px; }
-    .btn-nav { background:#23314b; border-color:#33507f; min-width:110px; }
-    .btn-del { background:#5e1b1b; border-color:#7d2e2e; min-width:140px; }
-    .btn-restore { background:#1b5e20; border-color:#2e7d32; min-width:120px; }
-    .tabs { display:flex; gap:8px; margin-top:12px; }
-    .tab { background:var(--panel2); border-color:var(--border2); }
-    .tab.active { background:#23314b; border-color:var(--accent); color:#fff; }
-    .filters { display:flex; gap:10px; align-items:flex-end; margin-top:12px; }
-    .filters .item { display:flex; flex-direction:column; gap:5px; }
-    .filters .item.small { width:130px; }
-    .badge { display:inline-block; background:#23314b; border:1px solid #33507f; border-radius:999px;
-             padding:1px 8px; font-size:12px; margin-left:6px; color:#cdd5e1; }
-    .meta { font-size:13px; color:#bbb; margin-top:8px; }
-    .err { color:#fda4af; }
-    .viewer-head { display:flex; justify-content:space-between; align-items:center; gap:10px; margin-bottom:10px; }
-    .viewer-head .name { font-size:13px; color:#cdd5e1; word-break:break-all; }
-    .viewer-head .count { font-size:13px; color:var(--muted); white-space:nowrap; }
-    .stage { display:flex; align-items:center; justify-content:center; background:#000;
-             border:1px solid var(--border); border-radius:8px; min-height:300px; }
-    .stage img { max-width:100%; max-height:72vh; display:block; border-radius:8px; }
-    .missing { color:var(--muted); padding:60px 0; font-size:14px; }
-    .controls { display:flex; gap:10px; justify-content:center; margin-top:12px; }
-    .hint { text-align:center; color:var(--muted); font-size:12px; margin-top:8px; }
-  </style>
+  <style>__CSS__</style>
 </head>
 <body>
-  <div class="wrap">
-    <a class="back" href="/">&larr; Back to tools</a>
+  <div class="wrap narrow">
+    <header class="topbar"><div class="brand"><span class="brand-dot"></span><span class="brand-name">CROP TOOLS</span></div><a class="home-btn" href="/home" title="Back to the app picker"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 10.5 12 3l9 7.5"/><path d="M5 9.5V20a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1V9.5"/><path d="M9.5 21v-6h5v6"/></svg>Home</a></header>
     <h1>__TITLE__</h1>
     <div class="panel">
       <div class="bar">
@@ -1696,8 +1802,10 @@ REVIEW_PAGE = """<!doctype html>
   function clearFilter(){
     document.getElementById("f_teacher").value = "";
     document.getElementById("f_student").value = "";
-    document.getElementById("f_student_op").value = "any";
-    onFilterChange();
+    // Dispatch change (not a bare .value=) so the themed dropdown's label resyncs;
+    // the select's onchange handler runs onFilterChange for us.
+    const _op = document.getElementById("f_student_op");
+    _op.value = "any"; _op.dispatchEvent(new Event("change", { bubbles: true }));
   }
 
   async function loadFolder(){
@@ -1844,26 +1952,29 @@ REVIEW_PAGE = """<!doctype html>
 """
 
 
-# A small floating popup, injected into every page except the disagreement page
-# itself, so a running disagreement batch stays visible while you use other cards.
 GLOBAL_PROGRESS = """
 <style>
-  #gp { position:fixed; right:16px; bottom:16px; width:300px; z-index:9999;
-        background:#161a22; border:1px solid #2b3140; border-radius:10px; color:#eef1f6;
-        font-family:'Segoe UI',system-ui,Arial,sans-serif; box-shadow:0 8px 30px rgba(0,0,0,.5); overflow:hidden; }
-  #gp.gp-hidden { display:none; }
-  #gp .gp-head { display:flex; align-items:center; justify-content:space-between; padding:8px 12px; background:#1b2f22; }
-  #gp .gp-title { font-size:12px; font-weight:600; letter-spacing:.3px; }
-  #gp .gp-actions button { background:transparent; border:none; color:#cdd5e1; font-size:16px; line-height:1; cursor:pointer; padding:0 5px; }
-  #gp .gp-actions button:hover { color:#fff; }
-  #gp .gp-body { padding:10px 12px; }
-  #gp.gp-min .gp-body { display:none; }
-  #gp .gp-msg { font-size:12px; color:#cbd3df; margin-bottom:6px; }
-  #gp .gp-bar { height:8px; background:#0c0e12; border:1px solid #2b3140; border-radius:5px; overflow:hidden; }
-  #gp .gp-bar > div { height:100%; width:0%; background:linear-gradient(90deg,#3b62d6,#5f89ff); transition:width .3s; }
-  #gp .gp-detail { font-size:11px; color:#9aa4b4; margin-top:6px; }
-  #gp .gp-open { display:inline-block; margin-top:8px; font-size:12px; color:#8fb0ff; text-decoration:none; }
-  #gp .gp-open:hover { text-decoration:underline; }
+  #gp{position:fixed;right:18px;bottom:18px;width:308px;z-index:9999;background:var(--panel);
+      border:1px solid var(--line-2);border-radius:13px;color:var(--text);font-family:var(--sans);
+      box-shadow:0 16px 40px rgba(0,0,0,.55);overflow:hidden;}
+  #gp.gp-hidden{display:none;}
+  #gp .gp-head{display:flex;align-items:center;justify-content:space-between;padding:9px 13px;
+      background:var(--panel-3);border-bottom:1px solid var(--line);}
+  #gp .gp-title{font-size:11px;font-weight:700;letter-spacing:1px;text-transform:uppercase;color:#c7cedb;
+      display:flex;align-items:center;gap:7px;}
+  #gp .gp-title::before{content:"";width:8px;height:8px;border-radius:50%;background:var(--go);
+      box-shadow:0 0 8px rgba(166,226,46,.6);}
+  #gp .gp-actions button{background:transparent;border:none;color:var(--muted);font-size:16px;line-height:1;
+      cursor:pointer;padding:0 5px;width:auto;min-height:0;}
+  #gp .gp-actions button:hover{color:var(--text);}
+  #gp .gp-body{padding:11px 13px;}
+  #gp.gp-min .gp-body{display:none;}
+  #gp .gp-msg{font-size:12px;color:#cbd3df;margin-bottom:7px;}
+  #gp .gp-bar{height:8px;background:#0c0f16;border:1px solid var(--line);border-radius:5px;overflow:hidden;}
+  #gp .gp-bar>div{height:100%;width:0%;background:linear-gradient(90deg,var(--hivis),var(--hivis-2));transition:width .3s;}
+  #gp .gp-detail{font-size:11px;color:var(--muted);margin-top:7px;font-family:var(--mono);}
+  #gp .gp-open{display:inline-block;margin-top:9px;font-size:12px;color:var(--hivis);text-decoration:none;}
+  #gp .gp-open:hover{text-decoration:underline;}
 </style>
 <div id="gp" class="gp gp-hidden">
   <div class="gp-head">
@@ -1890,7 +2001,7 @@ GLOBAL_PROGRESS = """
       let s;
       try { const r = await fetch("/api/disagree/status"); s = await r.json(); } catch(e){ return; }
       const running = !!s.running;
-      if(running && !wasRunning) dismissed = false;   // a fresh run un-dismisses the popup
+      if(running && !wasRunning) dismissed = false;
       wasRunning = running;
       const finalPhase = (s.phase==="done" || s.phase==="stopped" || s.phase==="error");
       const gp = el("gp");
@@ -1903,7 +2014,7 @@ GLOBAL_PROGRESS = """
       else if(finalPhase) pct = 100;
       el("gp_fill").style.width = Math.min(100, pct) + "%";
       let d = "";
-      if(s.videos_total>1) d += "Videos: " + s.videos_done + "/" + s.videos_total + " \\u00b7 ";
+      if(s.videos_total>1) d += "Videos: " + s.videos_done + "/" + s.videos_total + " · ";
       d += "Kept: " + (s.kept||0);
       el("gp_detail").textContent = d;
     }
@@ -1919,9 +2030,111 @@ def _inject_progress(page_html):
     return page_html.replace("</body>", GLOBAL_PROGRESS + "</body>", 1)
 
 
+# Progressive-enhancement dropdown script, injected into every page so all the
+# native <select>s across the crop tools get the same themed popover the
+# Inference Web App uses: hi-vis hover, one open at a time, search on long lists,
+# scroll-safe (scrolling the option list doesn't close it), fixed-positioned so a
+# panel's overflow can't clip it. The <select> stays in the DOM as the value
+# source of truth — we set its value and fire a real "change" event, so every
+# existing onchange handler keeps working untouched.
+DROPDOWN_SCRIPT = """
+<script>
+(function(){
+  function closeAllPopups(){
+    document.querySelectorAll(".dd-menu.open").forEach(function(m){ m.classList.remove("open"); });
+    document.querySelectorAll(".dd.open").forEach(function(d){ d.classList.remove("open"); });
+  }
+  function enhanceSelect(sel){
+    if(!sel || sel._dd) return;
+    sel.style.display = "none";
+    var dd = document.createElement("div"); dd.className = "dd";
+    // Preserve any inline width (e.g. the 80px operator dropdown) so flex rows
+    // keep their layout after we swap the native control out.
+    if(sel.style.width){ dd.style.width = sel.style.width; dd.style.flex = "0 0 auto"; }
+    var btn = document.createElement("button"); btn.type = "button"; btn.className = "dd-btn";
+    var menu = document.createElement("div"); menu.className = "dd-menu";
+    var search = document.createElement("input");
+    search.className = "dd-search"; search.placeholder = "Search\\u2026"; search.autocomplete = "off";
+    var scroll = document.createElement("div"); scroll.className = "dd-scroll";
+    menu.appendChild(search); menu.appendChild(scroll);
+    sel.parentNode.insertBefore(dd, sel);
+    dd.appendChild(btn);
+    document.body.appendChild(menu);
+    function labelFor(){ var o = sel.options[sel.selectedIndex]; return o ? o.text : "\\u2014"; }
+    function renderBtn(){ btn.textContent = labelFor(); btn.title = labelFor(); }
+    function buildMenu(){
+      scroll.innerHTML = "";
+      Array.prototype.forEach.call(sel.options, function(o, i){
+        var it = document.createElement("div");
+        it.className = "dd-opt" + (i === sel.selectedIndex ? " sel" : "");
+        it.textContent = o.text;
+        it.addEventListener("click", function(){
+          sel.selectedIndex = i;
+          sel.dispatchEvent(new Event("change", { bubbles: true }));
+          renderBtn(); close();
+        });
+        scroll.appendChild(it);
+      });
+      search.style.display = sel.options.length > 6 ? "block" : "none";
+    }
+    function filter(q){
+      q = (q || "").trim().toLowerCase();
+      scroll.querySelectorAll(".dd-opt").forEach(function(it){
+        it.style.display = (!q || it.textContent.toLowerCase().indexOf(q) !== -1) ? "" : "none";
+      });
+    }
+    function place(){
+      var r = btn.getBoundingClientRect();
+      menu.style.left = r.left + "px";
+      menu.style.top = (r.bottom + 4) + "px";
+      menu.style.width = r.width + "px";
+    }
+    function open(){
+      closeAllPopups();
+      buildMenu(); search.value = ""; filter(""); place();
+      menu.classList.add("open"); dd.classList.add("open");
+      if(search.style.display !== "none") setTimeout(function(){ search.focus(); }, 0);
+      var on = scroll.querySelector(".dd-opt.sel"); if(on) on.scrollIntoView({ block: "nearest" });
+    }
+    function close(){ menu.classList.remove("open"); dd.classList.remove("open"); }
+    btn.addEventListener("click", function(e){ e.stopPropagation();
+      menu.classList.contains("open") ? close() : open(); });
+    search.addEventListener("click", function(e){ e.stopPropagation(); });
+    search.addEventListener("input", function(){ filter(search.value); });
+    document.addEventListener("click", function(e){ if(!menu.contains(e.target) && e.target !== btn) close(); });
+    document.addEventListener("keydown", function(e){ if(e.key === "Escape") close(); });
+    // Close on page/panel scroll (the button moves), but NOT when scrolling the
+    // menu's own option list.
+    window.addEventListener("scroll", function(e){ if(!menu.contains(e.target)) close(); }, true);
+    window.addEventListener("resize", close);
+    // Keep the button label in sync when other code sets the <select>'s value and
+    // dispatches a change event (e.g. Clear filter resetting the operator).
+    sel.addEventListener("change", renderBtn);
+    sel._dd = { refresh: renderBtn };
+    renderBtn();
+  }
+  function enhanceAll(){
+    document.querySelectorAll("select").forEach(enhanceSelect);
+  }
+  window.closeAllPopups = closeAllPopups;
+  if(document.readyState === "loading"){
+    document.addEventListener("DOMContentLoaded", enhanceAll);
+  } else {
+    enhanceAll();
+  }
+})();
+</script>
+"""
+
+
+def _inject_dropdowns(page_html):
+    """Enhance every native <select> on the page with the themed dropdown UI."""
+    return page_html.replace("</body>", DROPDOWN_SCRIPT + "</body>", 1)
+
+
 @app.get("/")
 def index():
-    return Response(_inject_progress(LANDING_PAGE), mimetype="text/html")
+    return Response(_inject_dropdowns(_inject_progress(LANDING_PAGE)).replace("__CSS__", CROP_CSS), mimetype="text/html")
 
 
 @app.get("/balancer")
@@ -1931,11 +2144,12 @@ def balancer():
     selected_model = settings.get("model_path") or default_person_model(all_pt)
     options = build_model_options_html(all_pt, selected_model)
     page = (
-        PAGE.replace("__TITLE__", html.escape(APP_TITLE))
+        PAGE.replace("__CSS__", CROP_CSS)
+        .replace("__TITLE__", html.escape(APP_TITLE))
         .replace("__MODEL_OPTIONS__", options)
         .replace("__SETTINGS_JSON__", json.dumps(settings))
     )
-    return Response(_inject_progress(page), mimetype="text/html")
+    return Response(_inject_dropdowns(_inject_progress(page)), mimetype="text/html")
 
 
 @app.get("/disagreement")
@@ -1947,13 +2161,14 @@ def disagreement():
     dests = list_disagree_dests()
     dest_sel = settings.get("dest") if settings.get("dest") in dests else ""
     page = (
-        DISAGREE_PAGE.replace("__TITLE__", html.escape(DISAGREE_TITLE))
+        DISAGREE_PAGE.replace("__CSS__", CROP_CSS)
+        .replace("__TITLE__", html.escape(DISAGREE_TITLE))
         .replace("__TEACHER_OPTIONS__", build_model_options_html(all_pt, teacher_sel))
         .replace("__STUDENT_OPTIONS__", build_model_options_html(all_pt, student_sel))
         .replace("__DEST_OPTIONS__", build_dest_options_html(dests, dest_sel))
         .replace("__SETTINGS_JSON__", json.dumps(settings))
     )
-    return Response(page, mimetype="text/html")
+    return Response(_inject_dropdowns(page), mimetype="text/html")
 
 
 @app.get("/review")
@@ -1961,11 +2176,12 @@ def review():
     saved = load_review_folder()
     dests = list_disagree_dests()
     page = (
-        REVIEW_PAGE.replace("__TITLE__", html.escape(REVIEW_TITLE))
+        REVIEW_PAGE.replace("__CSS__", CROP_CSS)
+        .replace("__TITLE__", html.escape(REVIEW_TITLE))
         .replace("__REVIEW_DEST_OPTIONS__", build_review_dest_options_html(dests, saved))
         .replace("__SAVED_FOLDER__", json.dumps(saved))
     )
-    return Response(_inject_progress(page), mimetype="text/html")
+    return Response(_inject_dropdowns(_inject_progress(page)), mimetype="text/html")
 
 
 @app.get("/api/preview")
@@ -2008,6 +2224,7 @@ def api_run():
             cols = max(1, min(20, int(payload.get("cols", 4))))
             conf = max(0.0, min(1.0, float(payload.get("conf", 0.4))))
             stride = max(1, min(120, int(payload.get("stride", 15))))
+            min_gap_sec = max(0.0, float(payload.get("min_gap_sec", 0)))
         except (TypeError, ValueError):
             return jsonify({"ok": False, "error": "Invalid input values."}), 400
         if not input_path:
@@ -2017,6 +2234,7 @@ def api_run():
         save_settings({
             "video_path": input_path, "model_path": model_path, "total": total,
             "rows": rows, "cols": cols, "conf": conf, "stride": stride,
+            "min_gap_sec": min_gap_sec,
         })
 
         job.update({
@@ -2027,7 +2245,9 @@ def api_run():
             "result": None, "error": "",
         })
     t = threading.Thread(
-        target=run_batch, args=(input_path, model_path, total, rows, cols, conf, stride), daemon=True
+        target=run_batch,
+        args=(input_path, model_path, total, rows, cols, conf, stride, min_gap_sec),
+        daemon=True,
     )
     t.start()
     return jsonify({"ok": True})
@@ -2327,6 +2547,11 @@ def api_file():
 
 
 def _open_browser_when_ready(url, delay_sec=0.8):
+    # The npm launcher sets NO_BROWSER so it can open a single landing page
+    # instead of every app popping its own tab.
+    if os.environ.get("NO_BROWSER"):
+        return
+
     def _open():
         time.sleep(delay_sec)
         webbrowser.open(url)

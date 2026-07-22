@@ -33,3 +33,9 @@ review_settings.json
 saved_video_paths.json
 ppe_crop_centroids.jsonl
 ppe_cropper_paths.json
+
+# Unused legacy scripts moved out of the way
+trash/
+
+# Secrets — never commit
+.env
